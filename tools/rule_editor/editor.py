@@ -20,10 +20,16 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import dearpygui.dearpygui as dpg
+# The tier-3a rule engine (rules.py) is the pipeline's canonical copy in lib/;
+# both this editor and lib/categorizer.py import it so they categorize
+# identically. Put lib/ on the path before importing it (preview.py imports it
+# too). See plan.md §5.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "lib"))
 
-from preview import build_entries, changed, group_by_category, uncategorized
-from rules import (
+import dearpygui.dearpygui as dpg  # noqa: E402
+
+from preview import build_entries, changed, group_by_category, uncategorized  # noqa: E402
+from rules import (  # noqa: E402
     DEFAULT_COLUMNS, MATCH_MODES, OPS, Condition, Rule, load_rules, match_rule,
     save_rules, validate_rule,
 )

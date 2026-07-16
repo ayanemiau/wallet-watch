@@ -1,0 +1,8 @@
+# Pipeline dependencies (lib/ + scripts/).
+#   pip install -r requirements.txt
+#
+# The pipeline was stdlib-only through Phase 2; Phase 3 (categorize) reads the
+# tier-3a rule table rules/keywords.yaml, so it needs a YAML parser. This is the
+# same PyYAML the rule editor already used — lib/rules.py is now the shared
+# canonical engine both import (see plan.md §5).
+PyYAML>=6.0

@@ -5,9 +5,12 @@ a rule is a list of conditions on transaction columns combined by one
 operator (all/any), mapping to one category. Rules are ordered and the FIRST
 matching rule wins.
 
-Standalone by design — this tool is one optional way to edit keywords.yaml,
-not part of the pipeline, so it imports nothing from lib/. The contract with
-the pipeline is the YAML file format, not this module.
+This is the **single canonical engine** for tier 3a: both the pipeline
+(`lib/categorizer.py`) and the interactive editor (`tools/rule_editor/`) import
+it, so they categorize identically by construction. The engine works on plain
+`Dict[str, str]` rows (exactly what `schema.to_row()` produces and what a
+`csv.DictReader` yields), so it stays independent of the `Transaction`
+dataclass and tolerant of a CSV written by an older schema.
 
 See plan.md §5 (tier 3a).
 """
@@ -22,6 +25,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import yaml
+from schema import FIELDNAMES
 
 # bumped only on a breaking format change; readers reject what they don't know
 FORMAT_VERSION = 1
@@ -48,13 +52,10 @@ NUMERIC_OPS = ("gt", "gte", "lt", "lte")
 
 OPS = STRING_OPS + NUMERIC_OPS
 
-# Fallback column list, used only when no preview CSV is loaded to supply real
-# headers. Deliberately a copy of lib/schema.py's Transaction fields, not an
-# import: this tool stays standalone. If it drifts, the preview CSV's own
-# header wins anyway.
-DEFAULT_COLUMNS = ["date", "amount", "account", "is_reference",
-                   "original_description", "corrected_description",
-                   "category", "tags"]
+# Fallback column list, used by the editor only when no preview CSV is loaded to
+# supply real headers. These are schema.py's Transaction fields (the CSV column
+# contract); if a real preview CSV is loaded, its own header wins anyway.
+DEFAULT_COLUMNS = list(FIELDNAMES)
 
 
 @dataclass
