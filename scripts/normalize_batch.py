@@ -1,12 +1,15 @@
 """Batch orchestrator over the Normalizer library (plan.md §4).
 
 Scans a batch's raw/ dir, resolves each file's account against accounts.csv,
-runs the matching handler through Normalizer, and writes normalized.csv. This
-is one orchestrator over the library; a UI (drag files in, one-click run) would
-be another. The "scan dir -> load files -> look up type -> run" flow lives here,
-not in the library, precisely so it can be replaced.
+runs the matching handler through Normalizer, and writes a run-timestamped
+normalized_<YYYYMMDD>_<HHMMSS>.csv. This is one orchestrator over the library;
+a UI (drag files in, one-click run) would be another. The "scan dir -> load
+files -> look up type -> run" flow lives here, not in the library, precisely so
+it can be replaced.
 
-    python3 scripts/normalize_batch.py --batch-dir <batch> --data-dir <root>
+    python3 scripts/normalize_batch.py [--batch-dir <batch>] --data-dir <root>
+
+With no --batch-dir it runs the latest-start batch under <root>/batch/.
 """
 
 import sys
@@ -18,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import argparse  # noqa: E402
 import csv  # noqa: E402
 import os  # noqa: E402
+import re  # noqa: E402
 from datetime import datetime  # noqa: E402
 from typing import Dict, List, Optional, Tuple  # noqa: E402
 
@@ -27,13 +31,17 @@ from schema import Account  # noqa: E402
 
 ACCOUNTS_FILE = "accounts.csv"
 
+# a batch dir is named by its date range, YYYYMMDD-YYYYMMDD
+BATCH_ID_RE = re.compile(r"\d{8}-\d{8}")
+
 
 def parse_args() -> argparse.Namespace:
     # 1. --batch-dir points at batch/<batch-id>/; raw inputs come from its
-    #    raw/ subdir and output goes to <batch-dir>/normalized.csv.
+    #    raw/ subdir and output goes to a timestamped file beside it.
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--batch-dir", required=True, type=Path,
-                   help="batch workspace, e.g. $WALLET_WATCH_DATA_DIR/batch/20260101-20260630")
+    p.add_argument("--batch-dir", type=Path, default=None,
+                   help="batch workspace, e.g. $WALLET_WATCH_DATA_DIR/batch/20260101-20260630; "
+                        "defaults to the latest-start batch under <data-root>/batch/")
     p.add_argument("--data-dir", type=Path, default=None,
                    help="data root holding accounts.csv; defaults to $WALLET_WATCH_DATA_DIR")
     return p.parse_args()
@@ -49,6 +57,20 @@ def resolve_data_dir(arg: Path) -> Path:
     if not data_dir.is_dir():
         raise SystemExit(f"data root does not exist: {data_dir}")
     return data_dir
+
+
+def latest_batch_dir(data_dir: Path) -> Path:
+    # Default when --batch-dir is omitted: the batch with the latest start date.
+    # Batch dirs are named YYYYMMDD-YYYYMMDD, so a name sort orders by start date
+    # (then end date), and the max is the latest start.
+    batch_root = data_dir / "batch"
+    if not batch_root.is_dir():
+        raise SystemExit(f"no batch dir under data root: {batch_root}")
+    batches = sorted(d for d in batch_root.iterdir()
+                     if d.is_dir() and BATCH_ID_RE.fullmatch(d.name))
+    if not batches:
+        raise SystemExit(f"no batches found in {batch_root} (expected YYYYMMDD-YYYYMMDD dirs)")
+    return batches[-1]
 
 
 def list_raw_files(batch_dir: Path) -> List[Path]:
@@ -115,11 +137,21 @@ def main() -> None:
     args = parse_args()
     data_dir = resolve_data_dir(args.data_dir)
     accounts = load_accounts(data_dir)
-    out_path = args.batch_dir / "normalized.csv"
+
+    if args.batch_dir is not None:
+        batch_dir = args.batch_dir
+    else:
+        batch_dir = latest_batch_dir(data_dir)
+        print(f"using latest batch: {batch_dir.name}", file=sys.stderr)
+
+    # timestamp the output so a rerun versions rather than overwrites (run time,
+    # local): normalized_<YYYYMMDD>_<HHMMSS>.csv
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = batch_dir / f"normalized_{stamp}.csv"
 
     normalizer = Normalizer()
     try:
-        for raw_file in list_raw_files(args.batch_dir):
+        for raw_file in list_raw_files(batch_dir):
             # skip (don't fail) files the pipeline can't process yet: an
             # unknown id, or a known account whose type has no handler.
             account = resolve_account(raw_file, accounts)

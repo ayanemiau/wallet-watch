@@ -1,9 +1,12 @@
 """normalize_batch orchestrator / CLI tests. Fixtures are synthetic."""
 
 import csv
+import re
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "scripts"
@@ -11,9 +14,25 @@ DATA = REPO / "tests" / "fixtures" / "data"
 BATCH = DATA / "batch" / "20260101-20260131"
 SCRIPT = SCRIPTS / "normalize_batch.py"
 
+OUTPUT_RE = re.compile(r"normalized_\d{8}_\d{6}\.csv")
+
 sys.path.insert(0, str(SCRIPTS))
 
-from normalize_batch import account_id_from_filename, date_range_from_filename  # noqa: E402
+from normalize_batch import (  # noqa: E402
+    account_id_from_filename,
+    date_range_from_filename,
+    latest_batch_dir,
+)
+
+
+def read_output(batch_dir: Path):
+    """Locate the single run-timestamped output and return its rows."""
+    outs = sorted(batch_dir.glob("normalized_*.csv"))
+    assert len(outs) == 1, f"expected one normalized_*.csv, got {[o.name for o in outs]}"
+    assert OUTPUT_RE.fullmatch(outs[0].name)               # versioned, run-timestamped
+    assert not (batch_dir / "normalized.csv").exists()     # never the plain name
+    with outs[0].open(newline="") as fh:
+        return list(csv.DictReader(fh))
 
 
 def test_account_id_is_filename_prefix():
@@ -51,8 +70,7 @@ def test_end_to_end_output_is_date_sorted(tmp_path):
         check=True, capture_output=True, text=True,
     )
 
-    with (out_batch / "normalized.csv").open(newline="") as fh:
-        rows = list(csv.DictReader(fh))
+    rows = read_output(out_batch)
 
     # the credit file's 2025-12-31 row falls outside its 20260101_20260131
     # window and is dropped; 3 checking + 3 remaining credit = 6.
@@ -98,12 +116,47 @@ def test_unhandled_type_is_skipped_with_warning(tmp_path):
     assert "no handler for account type 'venmo'" in r.stderr
     assert "skipping" in r.stderr
 
-    with (out_batch / "normalized.csv").open(newline="") as fh:
-        rows = list(csv.DictReader(fh))
+    rows = read_output(out_batch)
 
     assert len(rows) == 6                                   # 2 discover + 2 capital + 2 wealthfront
     assert {r["account"] for r in rows} == {"Fake Discover", "Fake Capital", "Fake Wealthfront"}
     assert "-25.00" in {r["amount"] for r in rows}          # discover purchase, sign flipped
+
+
+def test_latest_batch_dir_selected(tmp_path):
+    batch_root = tmp_path / "batch"
+    (batch_root / "20250101-20250131").mkdir(parents=True)
+    (batch_root / "20260201-20260228").mkdir()
+    (batch_root / "notes").mkdir()                          # non-matching, ignored
+    assert latest_batch_dir(tmp_path).name == "20260201-20260228"
+
+
+def test_latest_batch_dir_none_is_error(tmp_path):
+    (tmp_path / "batch" / "notes").mkdir(parents=True)      # nothing matches the id shape
+    with pytest.raises(SystemExit, match="no batches found"):
+        latest_batch_dir(tmp_path)
+
+
+def test_defaults_to_latest_batch(tmp_path):
+    # with no --batch-dir, the latest-start batch is chosen and written to.
+    data = tmp_path / "data"
+    (data / "batch").mkdir(parents=True)
+    (data / "accounts.csv").write_bytes((DATA / "accounts.csv").read_bytes())
+
+    older = data / "batch" / "20250101-20250131"
+    newer = data / "batch" / "20260201-20260228"
+    for b in (older, newer):
+        (b / "raw").mkdir(parents=True)
+    for f in (DATA / "batch" / "20260201-20260228" / "raw").glob("*.csv"):
+        (newer / "raw" / f.name).write_bytes(f.read_bytes())
+
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--data-dir", str(data)],
+        check=True, capture_output=True, text=True,
+    )
+    assert "using latest batch: 20260201-20260228" in r.stderr
+    assert OUTPUT_RE.fullmatch(sorted(newer.glob("normalized_*.csv"))[0].name)
+    assert not list(older.glob("normalized_*.csv"))         # older batch untouched
 
 
 def test_data_dir_required(tmp_path, monkeypatch):

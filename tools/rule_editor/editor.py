@@ -112,8 +112,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rules", type=Path, default=None,
                    help="explicit path to a rules yaml (overrides --data-dir)")
     p.add_argument("--preview-csv", type=Path, default=None,
-                   help="normalized.csv to count matches against; "
-                        "defaults to the newest batch/*/normalized.csv under the data root")
+                   help="normalized CSV to count matches against; "
+                        "defaults to the newest batch/*/normalized_*.csv under the data root")
     return p.parse_args()
 
 
@@ -145,8 +145,10 @@ def resolve_preview_csv(args: argparse.Namespace, data_dir: Optional[Path]) -> O
         return args.preview_csv
     if data_dir is None:
         return None
-    # batch ids are YYYYMMDD-YYYYMMDD, so a name sort is chronological
-    found = sorted((data_dir / "batch").glob("*/normalized.csv"))
+    # normalize writes normalized_<YYYYMMDD>_<HHMMSS>.csv per run; batch ids are
+    # YYYYMMDD-YYYYMMDD, so a path sort orders by batch then run timestamp and
+    # the last is the newest run of the newest batch.
+    found = sorted((data_dir / "batch").glob("*/normalized_*.csv"))
     return found[-1] if found else None
 
 

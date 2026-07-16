@@ -53,7 +53,7 @@ $WALLET_WATCH_DATA_DIR/
         apple_20260101_20260630.csv
         amazon.csv                          # suffix optional
         splitwise.csv
-      normalized.csv            # step 2 output (staging) — ledger-checked, user-approved
+      normalized_20260701_142530.csv   # step 2 output (staging), one per run — ledger-checked, user-approved
       categorized.csv           # step 3 output (staging) — some rows flagged needs_review
   normalized/                    # committed store, grouped by year
     2026.csv
@@ -81,7 +81,7 @@ A batch flows through four steps with **two human gates**. Each step is a separa
                  v  normalize (phase 2) = handler dispatch: account id = raw filename prefix →
                  |    resolve account, pick handler by its `type`, parse → Transaction rows;
                  |    then cross-account: aggregation, ledger refs, friend transfers
-2. NORMALIZE → batch/.../normalized.csv   + ledger check report
+2. NORMALIZE → batch/.../normalized_<runtime>.csv   + ledger check report
                  |
                  ▸ GATE 1: user reviews ledger check → approve
                  v  categorize (3a → 3b [→ 3c later])
@@ -163,9 +163,9 @@ Per source, take the highest tier that works reliably: **① manual export → �
 
 ---
 
-## 4. Phase 2 — Normalize (→ `batch/<id>/normalized.csv`, GATE 1)
+## 4. Phase 2 — Normalize (→ `batch/<id>/normalized_<runtime>.csv`, GATE 1)
 
-`normalizer.py` (library) driven by `scripts/normalize_batch.py`, plus `reconcile.py`; pure, deterministic. Reads `batch/<id>/raw/*.csv` and writes `batch/<id>/normalized.csv` plus a ledger-check report. Two stages: **per-account parsing** (§4.1–4.2), then **cross-account resolution** (§4.3).
+`normalizer.py` (library) driven by `scripts/normalize_batch.py`, plus `reconcile.py`; pure, deterministic. Reads `batch/<id>/raw/*.csv` and writes a **run-timestamped** `batch/<id>/normalized_<YYYYMMDD>_<HHMMSS>.csv` plus a ledger-check report. The timestamp versions each run so a rerun (fixed handler, re-pulled export) never overwrites an earlier result. Run `normalize_batch.py` with no `--batch-dir` to process the latest-start batch under `<data-root>/batch/`. Two stages: **per-account parsing** (§4.1–4.2), then **cross-account resolution** (§4.3).
 
 ### 4.1 Account registry (`accounts.csv`)
 
@@ -222,7 +222,7 @@ With every source now unified `Transaction` rows:
   - Splitwise auto-settlements → read splitwise entry history to split them out.
   - Other direct transfers (I fronted the money) → flagged in the report for manual annotation (an LLM scan may later propose suggestions).
 
-**GATE 1** — the operator reviews the ledger-check report and approves `normalized.csv` before categorization runs.
+**GATE 1** — the operator reviews the ledger-check report and approves a specific run's `normalized_<runtime>.csv` before categorization runs.
 
 ---
 

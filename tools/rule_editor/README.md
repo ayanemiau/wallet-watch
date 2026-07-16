@@ -21,7 +21,8 @@ The rules file resolves to `<data-root>/rules/keywords.yaml`, where the root is 
 then `$WALLET_WATCH_DATA_DIR`, then it fails fast. `--rules PATH` points at one explicitly.
 
 Match counts need a normalized CSV. By default it picks the newest
-`<data-root>/batch/*/normalized.csv`; `--preview-csv PATH` overrides. With no CSV the editor
+`<data-root>/batch/*/normalized_*.csv` (normalize writes one per run); `--preview-csv PATH`
+overrides. With no CSV the editor
 still works — counts are just hidden. The CSV is read **read-only**, once, and never copied
 or written anywhere.
 
