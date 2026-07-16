@@ -1,0 +1,48 @@
+# === Data protection: keep ALL real financial data out of this repo ===
+# See CLAUDE.md. Real data lives in the external data root ($WALLET_WATCH_DATA_DIR),
+# never inside this repository.
+
+# Pipeline data directories, wherever they might get created in-tree
+/data/
+batch/
+raw/
+normalized/
+categorized/
+review_inbox/
+lookup/
+index/
+cache/
+rules/
+
+# But keep the synthetic test fixtures
+!tests/
+!tests/**
+
+# Common export / statement formats (real financial data)
+*.csv
+*.xlsx
+*.xls
+*.ofx
+*.qfx
+*.pdf
+
+# ...except obviously-synthetic fixtures committed on purpose
+!tests/fixtures/**
+
+# Local env / secrets
+.env
+.env.*
+*.local
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS
+.DS_Store
