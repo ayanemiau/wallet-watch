@@ -18,8 +18,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import argparse  # noqa: E402
 import csv  # noqa: E402
 import os  # noqa: E402
-from typing import Dict, List  # noqa: E402
+from datetime import datetime  # noqa: E402
+from typing import Dict, List, Optional, Tuple  # noqa: E402
 
+from handlers import has_handler  # noqa: E402
 from normalizer import NormalizeError, Normalizer  # noqa: E402
 from schema import Account  # noqa: E402
 
@@ -87,15 +89,25 @@ def account_id_from_filename(raw_file: Path) -> str:
     return raw_file.stem.split("_")[0]
 
 
-def resolve_account(raw_file: Path, accounts: Dict[str, Account]) -> Account:
-    # 3b. id -> account. An id with no registry row is a hard error, so
-    #     nothing is silently skipped. (type -> handler happens in inject.)
-    account_id = account_id_from_filename(raw_file)
-    if account_id not in accounts:
-        known = ", ".join(sorted(accounts))
-        raise SystemExit(
-            f"{raw_file.name}: no row in {ACCOUNTS_FILE} for id {account_id!r}; known: {known}")
-    return accounts[account_id]
+def date_range_from_filename(raw_file: Path) -> Tuple[str, str]:
+    # 3b. The two fields after the id are the export's window, YYYYMMDD each:
+    #     chaseXXXX_20250101_20260630.csv -> ("2025-01-01", "2026-06-30")
+    #     inject() then filters transactions to this inclusive range.
+    parts = raw_file.stem.split("_")
+    if len(parts) != 3:
+        raise SystemExit(f"{raw_file.name}: expected <id>_<startYYYYMMDD>_<endYYYYMMDD>.csv")
+    try:
+        start = datetime.strptime(parts[1], "%Y%m%d").strftime("%Y-%m-%d")
+        end = datetime.strptime(parts[2], "%Y%m%d").strftime("%Y-%m-%d")
+    except ValueError as e:
+        raise SystemExit(f"{raw_file.name}: bad date range in filename: {e}")
+    return start, end
+
+
+def resolve_account(raw_file: Path, accounts: Dict[str, Account]) -> Optional[Account]:
+    # 3b. id -> account, or None if the id has no registry row. main() skips
+    #     such files with a warning rather than failing the whole batch.
+    return accounts.get(account_id_from_filename(raw_file))
 
 
 def main() -> None:
@@ -108,9 +120,23 @@ def main() -> None:
     normalizer = Normalizer()
     try:
         for raw_file in list_raw_files(args.batch_dir):
+            # skip (don't fail) files the pipeline can't process yet: an
+            # unknown id, or a known account whose type has no handler.
             account = resolve_account(raw_file, accounts)
-            count = normalizer.inject(raw_file, account.type, account)
-            print(f"  {raw_file.name}: {count} rows", file=sys.stderr)
+            if account is None:
+                print(f"  {raw_file.name}: no account in {ACCOUNTS_FILE} for id "
+                      f"{account_id_from_filename(raw_file)!r}, skipping", file=sys.stderr)
+                continue
+            if not has_handler(account.type):
+                print(f"  {raw_file.name}: no handler for account type {account.type!r}, "
+                      f"skipping", file=sys.stderr)
+                continue
+            start, end = date_range_from_filename(raw_file)
+            result = normalizer.inject(raw_file, account.type, account, start, end)
+            msg = f"  {raw_file.name}: {result.kept} rows in {start}..{end}"
+            if result.dropped:
+                msg += f" ({result.dropped} outside range dropped)"
+            print(msg, file=sys.stderr)
         normalizer.output(out_path)
     except NormalizeError as e:
         raise SystemExit(e)

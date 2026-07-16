@@ -38,5 +38,11 @@ def get_handler(type_: str) -> Handler:
     return HANDLERS[type_]
 
 
+def has_handler(type_: str) -> bool:
+    """Whether a handler is registered for this type — lets a caller skip
+    files it can't process yet instead of provoking a hard error."""
+    return type_ in HANDLERS
+
+
 # import for side effect: each module registers its types on import
-from . import chase  # noqa: E402,F401
+from . import capital, chase, discover, wealthfront  # noqa: E402,F401

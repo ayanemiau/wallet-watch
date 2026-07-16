@@ -2,3 +2,7 @@ id,name,type
 chaseXXXX,Fake Checking,chase-checking
 chaseYYYY,Fake Card,chase-credit
 chaseZZZZ,Fake Card Two,chase-credit
+discoverXXXX,Fake Discover,discover-credit
+capitalXXXX,Fake Capital,capital-saving
+wealthfrontXXXX,Fake Wealthfront,wealthfront-saving
+venmoXXXX,Fake Venmo,venmo

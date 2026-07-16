@@ -68,8 +68,8 @@ class Account:
 
     # selects the Phase 2 handler that parses this account's raw export.
     # multiple accounts may share a type (e.g. two chase cards).
-    # available values: "chase", "apple", "amazon", "taobao", "xiaohongshu",
-    # "splitwise", "venmo", "zelle"...
+    # available values: "chase-checking", "chase-credit", "discover-credit",
+    # "capital-saving", "wealthfront-saving"... (more as handlers are added)
     type: str
 
     # optional human-readable note (institution, card purpose, etc.)
