@@ -12,8 +12,8 @@ not in the library, precisely so it can be replaced.
 import sys
 from pathlib import Path
 
-# make the src/ library importable without an install (see plan.md Decisions)
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+# make the lib/ library importable without an install (see plan.md Decisions)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
 import argparse  # noqa: E402
 import csv  # noqa: E402
@@ -62,7 +62,7 @@ def list_raw_files(batch_dir: Path) -> List[Path]:
 
 def load_accounts(data_dir: Path) -> Dict[str, Account]:
     # Load $DATA_DIR/accounts.csv into an id -> Account map
-    # (src/schema.py Account: id, name, type, description).
+    # (lib/schema.py Account: id, name, type, description).
     path = data_dir / ACCOUNTS_FILE
     if not path.is_file():
         raise SystemExit(f"account registry not found: {path}")

@@ -7,12 +7,12 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
-SRC = REPO / "src"
+LIB = REPO / "lib"
 SCRIPTS = REPO / "scripts"
 DATA = REPO / "tests" / "fixtures" / "data"
 BATCH = DATA / "batch" / "20260101-20260131"
 
-sys.path.insert(0, str(SRC))
+sys.path.insert(0, str(LIB))
 sys.path.insert(0, str(SCRIPTS))
 
 from handlers import get_handler  # noqa: E402

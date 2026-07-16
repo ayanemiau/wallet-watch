@@ -15,8 +15,8 @@ Design principles:
 
 ### Decisions
 
-- **Stack: Python** (confirmed) + `src/schema.py` (dataclasses as the canonical schema). Layered data is persisted as JSONL/CSV; the volume is small (2023 ≈ 1300 rows, 2022 ≈ 900 rows), so no database is needed.
-- **Schema format: plain dataclasses, not protobuf** (revised). The model started as `schema.proto`, but protobuf earned nothing here: every field is a `string` (so its type system bought no validation), there is no RPC, no cross-language consumer, and no binary serialization — everything persists as CSV text. That left a documented field list behind a `protoc` toolchain and a codegen step. The dataclasses in `src/schema.py` *are* the schema; field names map one-to-one onto CSV column headers, so no second schema format is needed. Schema evolution is "append a column, tolerate missing ones on read".
+- **Stack: Python** (confirmed) + `lib/schema.py` (dataclasses as the canonical schema). Layered data is persisted as JSONL/CSV; the volume is small (2023 ≈ 1300 rows, 2022 ≈ 900 rows), so no database is needed.
+- **Schema format: plain dataclasses, not protobuf** (revised). The model started as `schema.proto`, but protobuf earned nothing here: every field is a `string` (so its type system bought no validation), there is no RPC, no cross-language consumer, and no binary serialization — everything persists as CSV text. That left a documented field list behind a `protoc` toolchain and a codegen step. The dataclasses in `lib/schema.py` *are* the schema; field names map one-to-one onto CSV column headers, so no second schema format is needed. Schema evolution is "append a column, tolerate missing ones on read".
 - **LLM provider: deferred.** We build the non-LLM parts first — Phase 1 (acquisition), Phase 2 (handlers + normalize/reconcile), and the deterministic tiers 3a (rule table) + 3b (historical exact match). The 3c RAG/LLM tier and its provider/embedding choices are decided later, once the deterministic path is proven.
 
 ---
@@ -28,7 +28,7 @@ Design principles:
 **This repository — infra code only (safe to be public):**
 
 ```
-src/                   # importable libraries — no CLI, no data-root knowledge
+lib/                   # importable libraries — no CLI, no data-root knowledge
   schema.py            # canonical schema (Transaction / Account dataclasses)
   handlers/            # Phase 2 per-type handlers (registry keyed by account type)
   normalizer.py        # Phase 2 — Normalizer library (inject / output)
@@ -105,7 +105,7 @@ A batch flows through four steps with **two human gates**. Each step is a separa
 
 ## 2. Data Model
 
-`src/schema.py` defines two dataclasses:
+`lib/schema.py` defines two dataclasses:
 
 - `**Transaction`**: `date / amount / account / is_reference / original_description / corrected_description / category / tags`.
 - `**Account`**: `id / name / type / description` — one row per source account in the data repo's `accounts.csv`. `id` is unique and equals the raw filename prefix (`raw/<id>[_<suffix>].csv`); `name` is written to `Transaction.account`; `type` selects the Phase 2 handler.
@@ -206,9 +206,9 @@ def handle_credit(row, account) -> Transaction:
     ...
 ```
 
-Implemented types: `chase-checking`, `chase-credit` (`src/handlers/chase.py`).
+Implemented types: `chase-checking`, `chase-credit` (`lib/handlers/chase.py`).
 
-**Library vs orchestrator are separate files.** The `Normalizer` library lives in `src/normalizer.py` — `inject(raw_path, handler, account)` parses one export and accumulates the rows, `output(path)` writes them date-sorted. It holds no knowledge of `argparse`, `accounts.csv` or the batch layout. The **orchestrator** `scripts/normalize_batch.py` owns all of that: it resolves the data root, scans `raw/`, does id → account → type, and feeds the library. That "scan dir → look up type → run" flow is deliberately replaceable — a future UI (drag files in, one-click run) is just another orchestrator over the same class, and may make the batch script dev/testing-only. Errors raise `NormalizeError` rather than exiting, so an embedding caller can catch, report, and continue — only the CLI turns them into a non-zero exit.
+**Library vs orchestrator are separate files.** The `Normalizer` library lives in `lib/normalizer.py` — `inject(raw_path, handler, account)` parses one export and accumulates the rows, `output(path)` writes them date-sorted. It holds no knowledge of `argparse`, `accounts.csv` or the batch layout. The **orchestrator** `scripts/normalize_batch.py` owns all of that: it resolves the data root, scans `raw/`, does id → account → type, and feeds the library. That "scan dir → look up type → run" flow is deliberately replaceable — a future UI (drag files in, one-click run) is just another orchestrator over the same class, and may make the batch script dev/testing-only. Errors raise `NormalizeError` rather than exiting, so an embedding caller can catch, report, and continue — only the CLI turns them into a non-zero exit.
 
 A handler can be **just a function** (light sources like a clean bank CSV) or a **heavier module** (e.g. Apple email parsing, e-commerce order joining). The registry keeps that choice per-type and swappable; we start light and promote to a module only when a source earns it.
 
