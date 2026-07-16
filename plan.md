@@ -15,8 +15,9 @@ Design principles:
 
 ### Decisions
 
-- **Stack: Python** (confirmed) + the existing `schema.proto` (protobuf as the canonical schema). Layered data is persisted as JSONL/CSV; the volume is small (2023 ≈ 1300 rows, 2022 ≈ 900 rows), so no database is needed.
-- **LLM provider: deferred.** We build the non-LLM parts first — Phase 1 (ingestion), Phase 2 (normalize/reconcile), and the deterministic tiers 3a (rule table) + 3b (historical exact match). The 3c RAG/LLM tier and its provider/embedding choices are decided later, once the deterministic path is proven.
+- **Stack: Python** (confirmed) + `src/schema.py` (dataclasses as the canonical schema). Layered data is persisted as JSONL/CSV; the volume is small (2023 ≈ 1300 rows, 2022 ≈ 900 rows), so no database is needed.
+- **Schema format: plain dataclasses, not protobuf** (revised). The model started as `schema.proto`, but protobuf earned nothing here: every field is a `string` (so its type system bought no validation), there is no RPC, no cross-language consumer, and no binary serialization — everything persists as CSV text. That left a documented field list behind a `protoc` toolchain and a codegen step. The dataclasses in `src/schema.py` *are* the schema; field names map one-to-one onto CSV column headers, so no second schema format is needed. Schema evolution is "append a column, tolerate missing ones on read".
+- **LLM provider: deferred.** We build the non-LLM parts first — Phase 1 (acquisition), Phase 2 (handlers + normalize/reconcile), and the deterministic tiers 3a (rule table) + 3b (historical exact match). The 3c RAG/LLM tier and its provider/embedding choices are decided later, once the deterministic path is proven.
 
 ---
 
@@ -27,21 +28,22 @@ Design principles:
 **This repository — infra code only (safe to be public):**
 
 ```
-src/wallet_watch/
-  adapters/            # Phase 1 per-source adapters
-  normalize.py         # Phase 2
-  reconcile.py         # Phase 2 reconciliation
+src/
+  schema.py            # canonical schema (Transaction / Account dataclasses)
+  handlers/            # Phase 2 per-type handlers (registry keyed by account type)
+  normalize.py         # Phase 2 — handler dispatch + schema conversion
+  reconcile.py         # Phase 2 — cross-account resolution / ledger check
   categorize.py        # Phase 3 (3a/3b/3c)
   sheets.py            # output to Google Sheet
   pipeline.py          # orchestration entry point: python -m wallet_watch run
 tests/fixtures/        # synthetic/fake sample data only — never real exports
-schema.proto           # canonical schema
 ```
 
 **External data root — private, lives outside this repo (never committed here):**
 
 ```
 $WALLET_WATCH_DATA_DIR/
+  account.csv                    # Account registry (schema.py Account): id,name,type,description
   batch/                         # transient per-run workspaces (one folder per processing run)
     20260101-20260630/           # batch id = YYYYMMDD-YYYYMMDD date range of the raw data
       raw/                       # user drops manual exports here, one file per account
@@ -71,9 +73,12 @@ The pipeline is **ad-hoc / batch-oriented**, not a daemon. Whenever the operator
 A batch flows through four steps with **two human gates**. Each step is a separate command so the operator can stop, inspect, and resume.
 
 ```
-1. INGEST   user drops exports → batch/20260101-20260630/raw/<account>.csv   (fixed layout)
+1. ACQUIRE  user downloads/scrapes exports → batch/20260101-20260630/raw/<account-id>.csv
+            (phase 1: files only, nothing parsed)
                  |
-                 v  normalize (adapters → unified Transaction, stable id)
+                 v  normalize (phase 2) = handler dispatch: account id = raw filename prefix →
+                 |    resolve account, pick handler by its `type`, parse → Transaction rows;
+                 |    then cross-account: aggregation, ledger refs, friend transfers
 2. NORMALIZE → batch/.../normalized.csv   + ledger check report
                  |
                  ▸ GATE 1: user reviews ledger check → approve
@@ -98,10 +103,15 @@ A batch flows through four steps with **two human gates**. Each step is a separa
 
 ## 2. Data Model
 
-The canonical schema is already in `schema.proto`: `date / amount / account / is_reference / original_description / corrected_description / category / tags`.
+`src/schema.py` defines two dataclasses:
+
+- `**Transaction`**: `date / amount / account / is_reference / original_description / corrected_description / category / tags`.
+- `**Account**`: `id / name / type / description` — one row per source account in the data repo's `account.csv`. `id` is unique and equals the raw filename prefix (`raw/<id>.csv`); `name` is written to `Transaction.account`; `type` selects the Phase 2 handler.
+
+Notes:
 
 - `is_reference=true` = **ledger reference**: used to reconcile the master ledger but *not* counted as a transaction (avoids double-counting against order history).
-- Phase 1 adapters first emit their *own* raw columns; Phase 2 then unifies them into `Transaction`.
+- Phase 1 only acquires raw files. In Phase 2, each handler parses one source's raw export into unified `Transaction` rows (stamping `account` = the account's `name`), after which the same phase does the cross-account work (aggregation, ledger refs, friend transfers).
 - **No derived dedup id**: a transaction has no reliably unique key — same date/description/amount/memo can legitimately repeat — so commit does not dedup on content. Accidental double-commits are caught by the date-conflict guard at commit time instead.
 
 ### 2.1 Data Location & Separation
@@ -122,31 +132,86 @@ Defense in depth:
 
 ---
 
-## 3. Phase 1 — Raw Data Ingestion
+## 3. Phase 1 — Raw Data Acquisition
 
-The operator drops one raw export per account into `batch/<id>/raw/<account>.csv` (fixed layout). One adapter per source parses its canonical raw CSV. Fallback ladder for producing that export: **① manual export → ② write a crawl script → ③ screenshot + agent processing**. Stop at the highest tier that works reliably.
+**Getting the raw exports onto disk. Nothing is parsed here** — the output of this phase is just files.
 
-| Source | Preferred path | Primary info | Notes |
-|---|---|---|---|
-| Bank (chase cards) | manual quarterly CSV export | merchant + comment | Used as ledger; reconciled against orders, not counted directly |
-| Apple Store | agent reads email invoices ("Your receipt from Apple") | merchant + purchased item | Corresponding charge removed from the bank statement |
-| E-commerce (Taobao/Xiaohongshu/Amazon) | research one-click export; else screenshot + agent | merchant + product name | order history is the transaction source of truth |
-| Splitwise / Venmo / Zelle | export transaction history | sender/recipient + memo | friend meal advances; routed through review |
+For each account, obtain its export for the batch's date range and drop it at:
 
-**M1 does chase only** (most stable, best for wiring up the full chain); other sources are onboarded in later milestones.
+```
+batch/<batch-id>/raw/<account-id>.csv
+```
+
+`<account-id>` must match an `id` in the data repo's `account.csv` (see §4.1) — that filename is the contract Phase 2 dispatches on.
+
+### Acquisition ladder
+
+Per source, take the highest tier that works reliably: **① manual export → ② write a script to crawl → ③ screenshot + process by agent**.
+
+
+| Source                                     | Preferred path                                           | Primary info              | Notes                                                        |
+| ------------------------------------------ | -------------------------------------------------------- | ------------------------- | ------------------------------------------------------------ |
+| Bank (chase cards)                         | manual quarterly CSV export                              | merchant + comment        | Bank ledger; reconciled against orders, not counted directly |
+| Apple Store                                | agent reads email invoices ("Your receipt from Apple")   | merchant + purchased item | Corresponding charge removed from the bank statement         |
+| E-commerce (Amazon / Taobao / Xiaohongshu) | research one-click order export; else screenshot + agent | merchant + product name   | order history is the transaction source of truth             |
+| Splitwise / Venmo / Zelle                  | export transaction history                               | sender/recipient + memo   | friend meal advances; routed through review                  |
+
+
+**M1 does chase only** — a manual quarterly export, no code required.
 
 ---
 
 ## 4. Phase 2 — Normalize (→ `batch/<id>/normalized.csv`, GATE 1)
 
-`normalize.py` + `reconcile.py`, pure script, deterministic. Reads `batch/<id>/raw/*.csv`, writes `batch/<id>/normalized.csv` plus a ledger-check report:
+`normalize.py` + `reconcile.py`, pure script, deterministic. Reads `batch/<id>/raw/*.csv` and writes `batch/<id>/normalized.csv` plus a ledger-check report. Two stages: **per-account parsing** (§4.1–4.2), then **cross-account resolution** (§4.3).
 
-1. **Schema conversion**: each source's raw → `Transaction`.
-2. **E-commerce aggregation**: the platform's single lump charge in the bank is tagged `is_reference=true` (ledger reference + platform name); the corresponding order history is expanded into real transactions.
-3. **Ledger check**: check that "sum of a platform's orders" ≈ "sum of that platform's ledger references"; surface any delta over threshold in the report.
-4. **Friend transfers**: use the "actual single consumption" as the info source; the "actual payment/advance" (if I fronted it) is tagged as a ledger reference.
-   - Splitwise auto-settlements → read splitwise entry history to split them out.
-   - Other direct transfers (I fronted the money) → flagged in the report for manual annotation (an LLM scan may later propose suggestions).
+### 4.1 Account registry (`account.csv`)
+
+The data repo holds a single `account.csv` following `schema.py`'s `Account` — one row per account:
+
+```csv
+id,name,type,description
+chaseXXXX,chase-checking,chase,personal checking
+chaseYYYY,chase-travel,chase,travel card
+apple,apple,apple,app store + icloud
+amazon,amazon,amazon,retail orders
+splitwise,splitwise,splitwise,friend settlements
+```
+
+- `**id**` is unique and **equals the raw filename prefix** (`raw/<id>.csv`) — how a file is matched to its account.
+- `**name`** is stamped onto the `account` field of every `Transaction` this account produces (several ids may share a name, e.g. both chase cards → `chase`, if desired).
+- `**type**` selects the handler.
+
+### 4.2 Handler dispatch (schema conversion)
+
+Normalize walks `batch/<id>/raw/*.csv`; for each file it **extracts the account `id` from the filename prefix**, resolves that account's row in `account.csv`, and **selects the handler registered for the account's `type`**. Multiple ids can share a type (e.g. two chase cards → `chase`), so the handler is keyed by `type`, not by `id`. An `id` with no `account.csv` row, or a `type` with no registered handler → hard error, so nothing is silently skipped.
+
+A **handler** is `(raw_file, account) → list[Transaction]` — this is the **data schema conversion** step, turning one source's raw columns into unified `Transaction` rows. The registry is keyed by `type`:
+
+```python
+HANDLERS: dict[str, Handler] = {}
+
+def handler(type_: str):
+    def reg(fn): HANDLERS[type_] = fn; return fn
+    return reg
+
+@handler("chase")
+def handle_chase(raw_file, account) -> list[Transaction]:
+    # ... parse rows, stamping Transaction.account = account.name
+    ...
+```
+
+A handler can be **just a function** (light sources like a clean bank CSV) or a **heavier module** (e.g. Apple email parsing, e-commerce order joining). The registry keeps that choice per-type and swappable; we start light and promote to a module only when a source earns it.
+
+### 4.3 Cross-account resolution
+
+With every source now unified `Transaction` rows:
+
+1. **E-commerce aggregation**: the platform's single lump charge in the bank is tagged `is_reference=true` (ledger reference + platform name); the corresponding order history is expanded into real transactions.
+2. **Ledger check**: check that "sum of a platform's orders" ≈ "sum of that platform's ledger references"; surface any delta over threshold in the report.
+3. **Friend transfers**: use the "actual single consumption" as the info source; the "actual payment/advance" (if I fronted it) is tagged as a ledger reference.
+  - Splitwise auto-settlements → read splitwise entry history to split them out.
+  - Other direct transfers (I fronted the money) → flagged in the report for manual annotation (an LLM scan may later propose suggestions).
 
 **GATE 1** — the operator reviews the ledger-check report and approves `normalized.csv` before categorization runs.
 
@@ -154,7 +219,7 @@ The operator drops one raw export per account into `batch/<id>/raw/<account>.csv
 
 ## 5. Phase 3 — Categorize (→ `batch/<id>/categorized.csv`, GATE 2)
 
-`categorize.py` reads the approved `batch/<id>/normalized.csv` and writes `batch/<id>/categorized.csv`. Each row is resolved on first hit in order, and rows that aren't confidently categorized get a **`needs_review`** flag (a column in the CSV) rather than being routed to a separate directory:
+`categorize.py` reads the approved `batch/<id>/normalized.csv` and writes `batch/<id>/categorized.csv`. Each row is resolved on first hit in order, and rows that aren't confidently categorized get a `**needs_review`** flag (a column in the CSV) rather than being routed to a separate directory:
 
 - **3a Rule table (human-maintained)**: `rules/keywords.yaml` merchant/keyword → category mapping, handling the bulk of recurrent spending.
 - **3b Historical exact match (auto-generated)**: `norm_key(merchant, comment)` (strip digits/punctuation, collapse whitespace) dict lookup; on hit, reuse the historical category **without an LLM call**. Rebuilt every run via `build_lookup` from the committed `categorized/<year>.csv` history.
@@ -177,10 +242,10 @@ The LLM (3c) uses the latest Claude model (Haiku is enough for a short classific
 
 Wire up one **vertical slice** first (single source → full chain → output to sheet), then expand horizontally across sources and vertically into RAG.
 
-- **M0 — Scaffolding + data root**: set up the Python package structure, the `.gitignore`/`CLAUDE.md` data guards, data-root resolution (`--data-dir` / `WALLET_WATCH_DATA_DIR`), and the batch layout convention. Drop real sample CSVs into a batch under the external data root (not the repo); commit only **synthetic** fixtures under `tests/fixtures/`.
-- **M1 — Vertical slice (chase)**: the full four-step batch flow for one source — `ingest → normalize (+GATE 1) → categorize 3a+3b (+GATE 2) → commit to <year>.csv`. Verify idempotent in-batch re-runs and the commit date-conflict warning.
+- **M0 — Scaffolding + data root**: set up the Python package structure, the `.gitignore`/`CLAUDE.md` data guards, data-root resolution (`--data-dir` / `WALLET_WATCH_DATA_DIR`), the batch layout convention, and `account.csv`. Manually export real sample CSVs into a batch under the external data root (not the repo) — that's Phase 1 for chase; commit only **synthetic** fixtures under `tests/fixtures/`.
+- **M1 — Vertical slice (chase)**: the full four-step batch flow for one source — `acquire (manual export) → normalize: chase handler + cross-account (+GATE 1) → categorize 3a+3b (+GATE 2) → commit to <year>.csv`. Verify idempotent in-batch re-runs and the commit date-conflict warning.
 - **M2 — Max out deterministic categorization**: flesh out `rules/keywords.yaml` and 3b exact matching so ~80% of recurrent spending is auto-categorized (no `needs_review`).
-- **M3 — Expand sources**: onboard Apple (email reading), e-commerce order history, and the Splitwise/Venmo adapter into the batch raw layout.
+- **M3 — Expand sources**: for each new source, solve Phase 1 acquisition (email reading, order export, screenshot+agent) **and** register its Phase 2 handler `type` — Apple, e-commerce order history, Splitwise/Venmo.
 - **M4 — Ledger check & friend transfers**: e-commerce aggregation + ledger-reference check in the GATE 1 report; friend-transfer flagging + approve flow.
 - **M5 — 3c RAG (LLM, deferred)**: embedding index + few-shot LLM + confidence routing feeding `needs_review`. Provider decided here.
 - **M6 — Google Sheet output**: `sheets.py` injects the committed year files' structured data, integrating with the existing chart system.
@@ -192,8 +257,8 @@ Wire up one **vertical slice** first (single source → full chain → output to
 1. **E-commerce export method**: do Taobao/Xiaohongshu/Amazon offer one-click order export? If not, nail down a stable screenshot + agent flow.
 2. **Splitwise / Venmo export format**: confirm the export fields — can they cover "who paid, memo, split"?
 3. **Embedding provider**: local `sentence-transformers` (private, offline, plenty for this small volume, **recommended**) vs cloud (Voyage/OpenAI).
-4. **Proto fields to add**: whether to add `string categorizer_version`. (No dedup `id` — commit uses the date-conflict guard instead of a content key.)
+4. **Schema fields to add**: whether to add `categorizer_version` to `Transaction`. (No dedup `id` — commit uses the date-conflict guard instead of a content key.)
 5. **Date-conflict granularity**: warn if *any* transaction date in the batch already exists in the year file (simple, may over-warn on boundary overlaps), vs a tighter heuristic. Start with the simple per-date warning.
 6. **Review ergonomics**: `needs_review` rows are resolved by editing `batch/<id>/categorized.csv` directly — is a plain CSV edit good enough, or do we want a thin helper (e.g. a filtered view / local UI) once volume grows?
 7. **Google Sheet injection**: Sheets API with a service account vs manually pasting exported CSV.
-</content>
+
