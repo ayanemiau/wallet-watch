@@ -167,7 +167,7 @@ def load_preview(path: Optional[Path]) -> Tuple[List[Dict[str, str]], List[str]]
         reader = csv.DictReader(fh)
         rows = list(reader)
         # the CSV header IS the column list — more accurate than any constant,
-        # and it keeps this tool decoupled from src/schema.py
+        # and it keeps this tool decoupled from lib/schema.py
         columns = list(reader.fieldnames or DEFAULT_COLUMNS)
     return rows, columns
 

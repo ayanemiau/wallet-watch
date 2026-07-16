@@ -6,7 +6,7 @@ operator (all/any), mapping to one category. Rules are ordered and the FIRST
 matching rule wins.
 
 Standalone by design — this tool is one optional way to edit keywords.yaml,
-not part of the pipeline, so it imports nothing from src/. The contract with
+not part of the pipeline, so it imports nothing from lib/. The contract with
 the pipeline is the YAML file format, not this module.
 
 See plan.md §5 (tier 3a).
@@ -49,7 +49,7 @@ NUMERIC_OPS = ("gt", "gte", "lt", "lte")
 OPS = STRING_OPS + NUMERIC_OPS
 
 # Fallback column list, used only when no preview CSV is loaded to supply real
-# headers. Deliberately a copy of src/schema.py's Transaction fields, not an
+# headers. Deliberately a copy of lib/schema.py's Transaction fields, not an
 # import: this tool stays standalone. If it drifts, the preview CSV's own
 # header wins anyway.
 DEFAULT_COLUMNS = ["date", "amount", "account", "is_reference",
@@ -257,7 +257,7 @@ def validate_rule(rule: Rule) -> List[str]:
 #
 # Matches raw csv.DictReader string cells rather than typed objects: rules only
 # ever need string/Decimal comparisons, and reading rows as plain dicts keeps
-# this tool independent of src/schema.py (and tolerant of a normalized.csv
+# this tool independent of lib/schema.py (and tolerant of a normalized.csv
 # written by an older schema).
 
 

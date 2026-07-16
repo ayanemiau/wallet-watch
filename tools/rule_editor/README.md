@@ -3,7 +3,7 @@
 An interactive editor for the tier 3a rule table (`rules/keywords.yaml`) — see `plan.md` §5.
 
 **This is a standalone tool, not part of the pipeline.** It's one optional way to maintain
-`keywords.yaml`; editing the file by hand stays perfectly valid, and nothing in `src/`
+`keywords.yaml`; editing the file by hand stays perfectly valid, and nothing in `lib/`
 depends on this directory. The contract between the two is the *file format* below.
 
 Rules are ordered and **first match wins**, so a rule's real effect depends on every rule
@@ -140,7 +140,7 @@ changes.
 
 | File | What |
 | --- | --- |
-| `rules.py` | The format, the match engine, the in-repo guard. No UI, no `src/` imports. |
+| `rules.py` | The format, the match engine, the in-repo guard. No UI, no `lib/` imports. |
 | `preview.py` | What the rules do to a set of rows: the diff and the grouping. No UI. |
 | `editor.py` | DearPyGui UI + CLI entry point. |
 | `keywords.example.yaml` | Synthetic sample doubling as format docs. |

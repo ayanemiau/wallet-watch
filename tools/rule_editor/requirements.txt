@@ -1,4 +1,4 @@
-# Dependencies for tools/rule_editor only — the pipeline in src/ stays stdlib-only.
+# Dependencies for tools/rule_editor only — the pipeline in lib/ stays stdlib-only.
 #   pip install -r tools/rule_editor/requirements.txt
 PyYAML>=6.0
 
