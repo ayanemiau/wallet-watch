@@ -1,8 +1,10 @@
 """Phase 2 — normalize: raw per-account exports -> unified Transaction rows.
 
-Reads every raw export in a batch's `raw/` dir, dispatches each file to the
-handler registered for its account's type, and writes the merged, date-sorted
-result to `<batch-dir>/normalized.csv`.
+`Normalizer` is the reusable component: feed it one raw export at a time with
+`inject()`, then `output()` the merged, date-sorted result. It knows nothing
+about argparse, accounts.csv or the batch layout — an orchestrator resolves
+those and feeds it. `main()` below is one such orchestrator (the CLI); a UI or
+pipeline.py can drive the same class.
 
 See plan.md §4 for the full design.
 """
@@ -22,6 +24,67 @@ ACCOUNTS_FILE = "accounts.csv"
 # every checking row carries a trailing empty column; absorb it rather than
 # letting DictReader silently stash it under None
 RESTKEY = "__extra__"
+
+
+class NormalizeError(Exception):
+    """A raw export could not be normalized.
+
+    Raised instead of exiting so callers decide how to surface it: the CLI
+    converts it to SystemExit, a UI can catch it and keep running.
+    """
+
+
+class Normalizer:
+    """Accumulates Transactions from raw exports, then emits them as CSV.
+
+    Deliberately knows nothing about accounts.csv or the batch layout — the
+    caller resolves which handler and which account each file needs.
+    """
+
+    def __init__(self) -> None:
+        self.transactions: List[Transaction] = []
+
+    def inject(self, raw_transaction_path: Path, handler: str, account: Account) -> int:
+        """Parse one raw export with the named handler; keep the Transactions.
+
+        Additive: repeated calls accumulate, which is how several accounts
+        merge into one output. Returns the number of rows injected.
+        """
+        try:
+            handle = get_handler(handler)
+        except KeyError as e:
+            # e.args[0], not e: str(KeyError) reprs its arg and adds quotes
+            raise NormalizeError(f"{raw_transaction_path.name}: {e.args[0]}")
+
+        rows = []
+        with raw_transaction_path.open(newline="") as fh:
+            for lineno, row in enumerate(csv.DictReader(fh, restkey=RESTKEY), start=2):
+                extra = row.pop(RESTKEY, [])
+                if any(v.strip() for v in extra):
+                    raise NormalizeError(
+                        f"{raw_transaction_path.name}:{lineno}: unexpected trailing data: {extra!r}")
+                try:
+                    rows.append(handle(row, account))
+                except (KeyError, ValueError) as e:
+                    raise NormalizeError(f"{raw_transaction_path.name}:{lineno}: {e}")
+
+        # extend only once parsing succeeded, so a failed inject leaves no
+        # half-parsed file behind for a caller that catches and continues
+        self.transactions.extend(rows)
+        return len(rows)
+
+    def output(self, output_path: Path) -> None:
+        """Sort accumulated Transactions by date asc and write CSV.
+
+        Dates are YYYY-MM-DD, so a lexicographic sort is chronological; it is
+        stable, so rows keep their source order within a date.
+        """
+        self.transactions.sort(key=lambda t: t.date)
+        with output_path.open("w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=FIELDNAMES)
+            w.writeheader()
+            for txn in self.transactions:
+                w.writerow(to_row(txn))
 
 
 def parse_args() -> argparse.Namespace:
@@ -85,63 +148,36 @@ def account_id_from_filename(raw_file: Path) -> str:
     return raw_file.stem.split("_")[0]
 
 
-def load_handler(raw_file: Path, accounts: Dict[str, Account]):
-    # 3b. id -> account -> type -> handler. An id with no registry row, or a
-    #     type with no handler, is a hard error so nothing is silently skipped.
+def resolve_account(raw_file: Path, accounts: Dict[str, Account]) -> Account:
+    # 3b. id -> account. An id with no registry row is a hard error, so
+    #     nothing is silently skipped. (type -> handler happens in inject.)
     account_id = account_id_from_filename(raw_file)
     if account_id not in accounts:
         known = ", ".join(sorted(accounts))
         raise SystemExit(
             f"{raw_file.name}: no row in {ACCOUNTS_FILE} for id {account_id!r}; known: {known}")
-    account = accounts[account_id]
-    try:
-        return account, get_handler(account.type)
-    except KeyError as e:
-        raise SystemExit(f"{raw_file.name}: {e}")
-
-
-def normalize_file(raw_file: Path, accounts: Dict[str, Account]) -> List[Transaction]:
-    # 4. Apply the handler to every raw row: (row, account) -> Transaction.
-    account, handle = load_handler(raw_file, accounts)
-    out = []
-    with raw_file.open(newline="") as fh:
-        for lineno, row in enumerate(csv.DictReader(fh, restkey=RESTKEY), start=2):
-            extra = row.pop(RESTKEY, [])
-            if any(v.strip() for v in extra):
-                raise SystemExit(f"{raw_file.name}:{lineno}: unexpected trailing data: {extra!r}")
-            try:
-                out.append(handle(row, account))
-            except (KeyError, ValueError) as e:
-                raise SystemExit(f"{raw_file.name}:{lineno}: {e}")
-    return out
-
-
-def write_normalized(transactions: List[Transaction], out_path: Path) -> None:
-    # 5. Sort by date and write <batch-dir>/normalized.csv. Dates are
-    #    YYYY-MM-DD, so a lexicographic sort is chronological; it is stable,
-    #    so rows keep their source order within a date.
-    transactions.sort(key=lambda t: t.date)
-    with out_path.open("w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=FIELDNAMES)
-        w.writeheader()
-        for txn in transactions:
-            w.writerow(to_row(txn))
+    return accounts[account_id]
 
 
 def main() -> None:
+    # One orchestrator over Normalizer: scan the batch's raw dir, resolve each
+    # file's account, inject, then output. A UI would drive the same class.
     args = parse_args()
     data_dir = resolve_data_dir(args.data_dir)
     accounts = load_accounts(data_dir)
-
-    transactions: List[Transaction] = []
-    for raw_file in list_raw_files(args.batch_dir):
-        rows = normalize_file(raw_file, accounts)
-        print(f"  {raw_file.name}: {len(rows)} rows", file=sys.stderr)
-        transactions.extend(rows)
-
     out_path = args.batch_dir / "normalized.csv"
-    write_normalized(transactions, out_path)
-    print(f"wrote {len(transactions)} rows -> {out_path}", file=sys.stderr)
+
+    normalizer = Normalizer()
+    try:
+        for raw_file in list_raw_files(args.batch_dir):
+            account = resolve_account(raw_file, accounts)
+            count = normalizer.inject(raw_file, account.type, account)
+            print(f"  {raw_file.name}: {count} rows", file=sys.stderr)
+        normalizer.output(out_path)
+    except NormalizeError as e:
+        raise SystemExit(e)
+
+    print(f"wrote {len(normalizer.transactions)} rows -> {out_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":

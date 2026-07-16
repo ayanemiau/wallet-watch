@@ -106,7 +106,7 @@ A batch flows through four steps with **two human gates**. Each step is a separa
 `src/schema.py` defines two dataclasses:
 
 - `**Transaction`**: `date / amount / account / is_reference / original_description / corrected_description / category / tags`.
-- `**Account**`: `id / name / type / description` — one row per source account in the data repo's `accounts.csv`. `id` is unique and equals the raw filename prefix (`raw/<id>[_<suffix>].csv`); `name` is written to `Transaction.account`; `type` selects the Phase 2 handler.
+- `**Account`**: `id / name / type / description` — one row per source account in the data repo's `accounts.csv`. `id` is unique and equals the raw filename prefix (`raw/<id>[_<suffix>].csv`); `name` is written to `Transaction.account`; `type` selects the Phase 2 handler.
 
 Notes:
 
@@ -183,7 +183,7 @@ splitwise,splitwise,splitwise,friend settlements
 
 - `**id**` is unique and **equals the raw filename prefix** (`raw/<id>[_<suffix>].csv`) — how a file is matched to its account. Real ids live only in the private data root, never here.
 - `**name`** is stamped onto the `account` field of every `Transaction` this account produces (several ids may share a name, e.g. both chase cards → `chase`, if desired).
-- `**type**` selects the handler.
+- `**type`** selects the handler.
 
 ### 4.2 Handler dispatch (schema conversion)
 
@@ -205,6 +205,8 @@ def handle_credit(row, account) -> Transaction:
 ```
 
 Implemented types: `chase-checking`, `chase-credit` (`src/handlers/chase.py`).
+
+**Normalize is a component, not just a script.** `src/normalize.py` exposes a `Normalizer` class — `inject(raw_path, handler, account)` parses one export and accumulates the rows, `output(path)` writes them date-sorted. It holds no knowledge of `argparse`, `accounts.csv` or the batch layout: the **orchestrator** resolves id → account → type and feeds it. The CLI `main()` is one orchestrator; `pipeline.py` or a future UI can drive the same class. Errors raise `NormalizeError` rather than exiting, so an embedding caller can catch, report, and continue — only the CLI turns them into a non-zero exit.
 
 A handler can be **just a function** (light sources like a clean bank CSV) or a **heavier module** (e.g. Apple email parsing, e-commerce order joining). The registry keeps that choice per-type and swappable; we start light and promote to a module only when a source earns it.
 
