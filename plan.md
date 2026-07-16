@@ -28,13 +28,15 @@ Design principles:
 **This repository — infra code only (safe to be public):**
 
 ```
-src/
+src/                   # importable libraries — no CLI, no data-root knowledge
   schema.py            # canonical schema (Transaction / Account dataclasses)
   handlers/            # Phase 2 per-type handlers (registry keyed by account type)
-  normalize.py         # Phase 2 — handler dispatch + schema conversion
+  normalizer.py        # Phase 2 — Normalizer library (inject / output)
   reconcile.py         # Phase 2 — cross-account resolution / ledger check
   categorize.py        # Phase 3 (3a/3b/3c)
   sheets.py            # output to Google Sheet
+scripts/               # runnable orchestrators that drive the libraries
+  normalize_batch.py   # scan a batch's raw/, resolve accounts, run Normalizer
   pipeline.py          # orchestration entry point: python -m wallet_watch run
 tests/fixtures/        # synthetic/fake sample data only — never real exports
 ```
@@ -163,7 +165,7 @@ Per source, take the highest tier that works reliably: **① manual export → �
 
 ## 4. Phase 2 — Normalize (→ `batch/<id>/normalized.csv`, GATE 1)
 
-`normalize.py` + `reconcile.py`, pure script, deterministic. Reads `batch/<id>/raw/*.csv` and writes `batch/<id>/normalized.csv` plus a ledger-check report. Two stages: **per-account parsing** (§4.1–4.2), then **cross-account resolution** (§4.3).
+`normalizer.py` (library) driven by `scripts/normalize_batch.py`, plus `reconcile.py`; pure, deterministic. Reads `batch/<id>/raw/*.csv` and writes `batch/<id>/normalized.csv` plus a ledger-check report. Two stages: **per-account parsing** (§4.1–4.2), then **cross-account resolution** (§4.3).
 
 ### 4.1 Account registry (`accounts.csv`)
 
@@ -206,7 +208,7 @@ def handle_credit(row, account) -> Transaction:
 
 Implemented types: `chase-checking`, `chase-credit` (`src/handlers/chase.py`).
 
-**Normalize is a component, not just a script.** `src/normalize.py` exposes a `Normalizer` class — `inject(raw_path, handler, account)` parses one export and accumulates the rows, `output(path)` writes them date-sorted. It holds no knowledge of `argparse`, `accounts.csv` or the batch layout: the **orchestrator** resolves id → account → type and feeds it. The CLI `main()` is one orchestrator; `pipeline.py` or a future UI can drive the same class. Errors raise `NormalizeError` rather than exiting, so an embedding caller can catch, report, and continue — only the CLI turns them into a non-zero exit.
+**Library vs orchestrator are separate files.** The `Normalizer` library lives in `src/normalizer.py` — `inject(raw_path, handler, account)` parses one export and accumulates the rows, `output(path)` writes them date-sorted. It holds no knowledge of `argparse`, `accounts.csv` or the batch layout. The **orchestrator** `scripts/normalize_batch.py` owns all of that: it resolves the data root, scans `raw/`, does id → account → type, and feeds the library. That "scan dir → look up type → run" flow is deliberately replaceable — a future UI (drag files in, one-click run) is just another orchestrator over the same class, and may make the batch script dev/testing-only. Errors raise `NormalizeError` rather than exiting, so an embedding caller can catch, report, and continue — only the CLI turns them into a non-zero exit.
 
 A handler can be **just a function** (light sources like a clean bank CSV) or a **heavier module** (e.g. Apple email parsing, e-commerce order joining). The registry keeps that choice per-type and swappable; we start light and promote to a module only when a source earns it.
 

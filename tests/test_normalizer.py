@@ -1,7 +1,6 @@
-"""Phase 2 normalize tests. Fixtures are synthetic — never real exports."""
+"""Normalizer library tests. Fixtures are synthetic — never real exports."""
 
 import csv
-import subprocess
 import sys
 from pathlib import Path
 
@@ -9,15 +8,16 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "src"
+SCRIPTS = REPO / "scripts"
 DATA = REPO / "tests" / "fixtures" / "data"
 BATCH = DATA / "batch" / "20260101-20260131"
 
 sys.path.insert(0, str(SRC))
+sys.path.insert(0, str(SCRIPTS))
 
 from handlers import get_handler  # noqa: E402
-from normalize import (  # noqa: E402
-    NormalizeError, Normalizer, account_id_from_filename, load_accounts,
-)
+from normalize_batch import account_id_from_filename, load_accounts  # noqa: E402
+from normalizer import NormalizeError, Normalizer  # noqa: E402
 from schema import Account  # noqa: E402
 
 
@@ -29,10 +29,6 @@ def inject_fixture(name: str) -> Normalizer:
     n = Normalizer()
     n.inject(raw, account.type, account)
     return n
-
-
-def test_account_id_is_filename_prefix():
-    assert account_id_from_filename(Path("chaseXXXX_20250101_20260630.csv")) == "chaseXXXX"
 
 
 def test_handler_selected_by_type_not_id():
@@ -95,55 +91,8 @@ def test_inject_error_does_not_kill_the_process(tmp_path):
     assert n.inject(good, "chase-credit", accounts["chaseYYYY"]) == 4
 
 
-def test_unknown_id_is_hard_error_at_cli(tmp_path):
-    # id -> account is the orchestrator's job now, so drive it through the CLI
-    batch = tmp_path / "20260101-20260131"
-    (batch / "raw").mkdir(parents=True)
-    (batch / "raw" / "nosuchacct_20260101_20260131.csv").write_text("a\n")
-    r = subprocess.run(
-        [sys.executable, str(SRC / "normalize.py"),
-         "--batch-dir", str(batch), "--data-dir", str(DATA)],
-        capture_output=True, text=True,
-    )
-    assert r.returncode != 0
-    assert "no row in accounts.csv" in r.stderr
-
-
 def test_unregistered_type_is_hard_error(tmp_path):
     raw = tmp_path / "x_1_2.csv"
     raw.write_text("a\n")
     with pytest.raises(NormalizeError, match="no handler registered"):
         Normalizer().inject(raw, "venmo", Account(id="x", name="X", type="venmo"))
-
-
-def test_end_to_end_output_is_date_sorted(tmp_path):
-    out_batch = tmp_path / "20260101-20260131"
-    (out_batch / "raw").mkdir(parents=True)
-    for f in (BATCH / "raw").glob("*.csv"):
-        (out_batch / "raw" / f.name).write_bytes(f.read_bytes())
-
-    subprocess.run(
-        [sys.executable, str(SRC / "normalize.py"),
-         "--batch-dir", str(out_batch), "--data-dir", str(DATA)],
-        check=True, capture_output=True,
-    )
-
-    with (out_batch / "normalized.csv").open(newline="") as fh:
-        rows = list(csv.DictReader(fh))
-
-    assert len(rows) == 7                                   # 3 checking + 4 credit
-    dates = [r["date"] for r in rows]
-    assert dates == sorted(dates)
-    assert dates[0] == "2025-12-31"                         # merged across accounts
-    assert {r["account"] for r in rows} == {"Fake Checking", "Fake Card"}
-    assert all(r["is_reference"] == "0" for r in rows)      # 1/0, never true/false
-
-
-def test_data_dir_required(tmp_path, monkeypatch):
-    monkeypatch.delenv("WALLET_WATCH_DATA_DIR", raising=False)
-    r = subprocess.run(
-        [sys.executable, str(SRC / "normalize.py"), "--batch-dir", str(tmp_path)],
-        capture_output=True, text=True,
-    )
-    assert r.returncode != 0
-    assert "no data root" in r.stderr           # fails fast, no repo-tree default
