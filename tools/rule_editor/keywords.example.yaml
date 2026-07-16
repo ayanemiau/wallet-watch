@@ -1,0 +1,54 @@
+# Example rule table — SYNTHETIC. Every merchant below is made up.
+#
+# Copy this to your data root to get started:
+#   cp tools/rule_editor/keywords.example.yaml "$WALLET_WATCH_DATA_DIR/rules/keywords.yaml"
+#
+# Never edit this file into your real rules: real merchants must stay in the
+# external data root (see CLAUDE.md). The editor refuses to write anywhere
+# inside this repo.
+#
+# Order matters: the FIRST rule that matches a transaction wins.
+version: 1
+rules:
+  # A single keyword on one column — the common case.
+  - category: Coffee
+    match: any
+    conditions:
+      - column: original_description
+        op: contains
+        value: FAKE COFFEE CO
+      - column: original_description
+        op: contains
+        value: SAMPLE ROASTERS
+
+  # `all` narrows: this fires only on spend (negative amounts), so a refund
+  # from the same merchant falls through to a later rule.
+  - category: Groceries
+    match: all
+    conditions:
+      - column: original_description
+        op: contains
+        value: FAKE GROCER
+      - column: amount
+        op: lt
+        value: "0"
+
+  # Numeric ops compare as decimals, so "-9.99" < "-5" behaves correctly.
+  - category: Subscriptions
+    match: all
+    conditions:
+      - column: original_description
+        op: starts_with
+        value: EXAMPLE STREAMING
+      - column: amount
+        op: gte
+        value: "-20"
+
+  # regex is available when keywords aren't enough; matching is
+  # case-insensitive for every string op, regex included.
+  - category: Transit
+    match: any
+    conditions:
+      - column: original_description
+        op: regex
+        value: "(sample|placeholder) (transit|rail)"

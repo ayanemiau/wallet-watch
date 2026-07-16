@@ -1,0 +1,10 @@
+# Dependencies for tools/rule_editor only — the pipeline in src/ stays stdlib-only.
+#   pip install -r tools/rule_editor/requirements.txt
+PyYAML>=6.0
+
+# UI toolkit. Tkinter was the first choice (stdlib, nothing to install), but the
+# Tk 8.5 bundled with macOS system Python cannot open a window on macOS 26+
+# ("macOS 26 or later required, have instead 16"), and fixing that means
+# installing a whole second Python. DearPyGui is a pip wheel that works on the
+# system interpreter as-is.
+dearpygui>=1.10
