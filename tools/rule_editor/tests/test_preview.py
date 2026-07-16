@@ -133,17 +133,20 @@ def test_uncategorized_is_everything_when_there_are_no_rules():
 # --- group_by_category ---
 
 
-def test_group_by_category_sorts_by_count_desc():
-    live = [rule("Coffee", "FAKE COFFEE"), rule("Bulk", "E")]  # "E" catches the rest
+def test_group_by_category_sorts_alphabetically():
+    # count order (Zebra 3, Alpha 1) is the reverse of alpha order, so this
+    # would fail under the old biggest-first sort
+    live = [rule("Alpha", "FAKE COFFEE"), rule("Zebra", "E")]  # "E" catches the rest
     groups = group_by_category(build_entries([], live, ROWS))
-    assert [(name, len(rows)) for name, rows in groups] == [("Bulk", 3), ("Coffee", 1)]
+    assert [(name, len(rows)) for name, rows in groups] == [("Alpha", 1), ("Zebra", 3)]
 
 
-def test_group_by_category_breaks_ties_on_name_for_stable_tab_order():
-    # equal-sized groups must not swap places between refreshes
-    live = [rule("Zebra", "FAKE COFFEE"), rule("Alpha", "FAKE GROCER")]
+def test_group_by_category_sorts_case_insensitively():
+    # casefold, so lowercase 'apple' sorts before 'Zebra'; a plain str sort
+    # would put all-caps first and flip them
+    live = [rule("Zebra", "FAKE COFFEE"), rule("apple", "FAKE GROCER")]
     groups = group_by_category(build_entries([], live, ROWS))
-    assert [name for name, _ in groups] == ["Alpha", "Zebra"]
+    assert [name for name, _ in groups] == ["apple", "Zebra"]
 
 
 def test_group_by_category_excludes_uncategorized_rows():

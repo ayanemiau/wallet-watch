@@ -98,36 +98,39 @@ auto-categorized).
 
 ## The transactions panel
 
-**Preview** toggles a panel showing the actual rows, not just counts. It needs a preview CSV,
-so the button is disabled without one. Three kinds of tab:
+The panel sits to the right of the rules whenever a preview CSV is loaded (without one there's
+nothing to show, so it's hidden and the rules take the full width). It shows the actual rows,
+not just counts:
 
 - **Changed** — rows whose category your unsaved edits move, as `from → to`. This diffs
   against the rules **as saved on disk**, so it's empty right after a Save, and *everything*
   shows as `— → X` before your first save (no saved rules means no previous categories).
 - **Uncategorized** — rows no rule matches. This is the worklist: it's what you read to decide
   which rule to write next.
-- **One tab per category** — what actually landed there, biggest category first. The `rule`
-  column gives the winning rule's number (`#3`, matching the numbered cards on the left), so
-  a row that arrived via the wrong rule is visible rather than merely present.
+- **Categories** — a dropdown, because a real rule set runs to ~20 `<main>/<sub>` categories
+  and that many tabs are worse to navigate than a list. Pick a category to see what landed
+  there, listed **alphabetically**. The `rule` column gives the winning rule's number (`#3`,
+  matching the numbered cards on the left), so a row that arrived via the wrong rule is visible
+  rather than merely present.
 
-The tab strip scrolls sideways when there are more categories than fit, so a tab keeps its
-full label instead of shrinking to an unreadable nub. Scroll it with the horizontal scrollbar
-or shift-mouse-wheel.
+**Preview is a manual refresh, not a toggle.** The panel does not follow your edits live: it
+shows the snapshot from the last time you pressed **Preview**, and while your rules have
+changed since then the button flags it with a `●` marker. This keeps typing and reordering
+free of the 28–45ms table rebuild a live panel would pay on every keystroke — worst exactly
+when you type a keyword's first letter and it still matches everything — and lets you make a
+few edits before judging their combined effect. Click **Preview** when you want the panel to
+catch up. (Save doesn't auto-refresh either, so the marker stays lit after a save until you
+press Preview.)
 
 A description too long for its column gets the full text in a hover tooltip. Only long ones —
 whether a description clips depends on the tab (the Changed tab's description column is
 narrower than Uncategorized's), so the threshold adapts per tab and short descriptions don't
 pop a needless tooltip.
 
-The panel follows your edits automatically — no refresh button. Structural changes (adding,
-deleting, reordering) rebuild it at once; typing rebuilds it a beat after you stop. That pause
-is deliberate: the diff itself costs ~2ms on 1400 rows, but building the table widgets costs
-28–45ms, which would hitch every keystroke — worst exactly when you type a keyword's first
-letter and it still matches everything.
+Only the visible tab is built, so switching tabs — or picking a category — is what pays for a
+table, not the refresh itself.
 
-Only the visible tab is built, so switching tabs is what pays for a tab, not opening the panel.
-
-The window defaults to 1400px wide so the rules keep their room with the panel open; drag the
+The window defaults to 1400px wide so the rules keep their room alongside the panel; drag the
 column edges in the table to rebalance, or resize the window.
 
 **Caveat: saving drops comments.** PyYAML doesn't round-trip them, so hand-written comments in

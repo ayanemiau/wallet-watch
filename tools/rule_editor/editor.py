@@ -17,7 +17,6 @@ import copy
 import csv
 import os
 import sys
-import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -56,19 +55,13 @@ DIRTY_TXT = "dirty_text"
 FOOTER_TXT = "footer_text"
 ALERT = "alert_modal"
 PANEL = "panel"
-# A custom tab strip, not dpg.tab_bar: the built-in bar has no scroll fitting
-# policy in the 1.10 API, so with many categories it shrinks every tab to an
-# unreadable ~23px nub. This is a horizontally-scrolling row of buttons instead.
+# The tab strip holds two fixed buttons (Changed, Uncategorized) plus a single
+# Categories combo. It replaced a per-category row of buttons: the operator uses
+# ~20 `<main>/<sub>` categories, and a scrolling row of that many tabs is worse
+# to navigate than a dropdown.
 PANEL_TABSTRIP = "panel_tabstrip"
 PANEL_CONTENT = "panel_content"
 TABSTRIP_H = 52
-
-# Rebuild the panel this long after the last keystroke rather than on each one.
-# Measured on a real 1396-row csv: the pure diff is ~2ms, but building the table
-# widgets costs 28-45ms, which is a visible hitch on every character — and the
-# first letter of a keyword is exactly when it matches the most rows. Waiting
-# for a pause makes typing free and still feels live.
-PANEL_DEBOUNCE_S = 0.2
 
 # Transactions panel. 680 leaves ~700 for the rules column at the default 1400
 # viewport, which is what a card needs once laid out tightly.
@@ -244,6 +237,28 @@ def tab_themes() -> Tuple[str, str]:
     return active, inactive
 
 
+def combo_tab_themes() -> Tuple[str, str]:
+    """(active, inactive) themes for the Categories combo in the tab strip.
+
+    A combo needs its own theme: tab_themes targets mvButton, which does not
+    touch a combo's box. Only the closed box is coloured here (FrameBg + the
+    dropdown arrow) — Text is left at the default dark on purpose. Theming a
+    combo also themes its popup list, and white-on-surface items would vanish.
+    """
+    with dpg.theme() as active:
+        with dpg.theme_component(dpg.mvCombo):
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBg, ACCENT)
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, ACCENT_ACTIVE)
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, ACCENT_ACTIVE)
+            dpg.add_theme_color(dpg.mvThemeCol_Button, ACCENT_ACTIVE)
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, ACCENT_ACTIVE)
+    with dpg.theme() as inactive:
+        with dpg.theme_component(dpg.mvCombo):
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBg, SURFACE)
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, BORDER)
+    return active, inactive
+
+
 def init_font() -> None:
     # DPG's built-in font is tiny on a retina display. A missing font must never
     # be fatal — fall back to scaling the built-in one.
@@ -285,6 +300,7 @@ class RuleEditor:
         self.count_tags: List[int] = []
         self.accent = accent_theme()
         self.tab_active, self.tab_inactive = tab_themes()
+        self.combo_active, self.combo_inactive = combo_tab_themes()
         # ROW_H is derived from the theme's font size, but init_font falls back
         # to a scaled built-in font when the system ones are missing. Measure a
         # real row on the first frame rather than trust the arithmetic — cards
@@ -292,16 +308,17 @@ class RuleEditor:
         self.row_h = ROW_H
         self.calibrated = False
 
-        # transactions panel state
-        self.panel_open = False
+        # transactions panel state. The panel is always visible when a CSV is
+        # loaded (never toggled); Preview is a manual refresh, not a show/hide.
+        self.panel_shown = bool(self.rows)
         self.active_tab = KEY_CHANGED
-        self.tab_buttons: Dict[str, int] = {}   # tab key -> strip button id
+        self.tab_buttons: Dict[str, int] = {}   # fixed tab key -> strip button id
+        self.cat_combo: Optional[int] = None    # the Categories combo, or None
+        self.cat_choice_keys: Dict[str, str] = {}  # combo label -> "cat:<name>"
         self.tab_entries: Dict[str, List] = {}  # tab key -> rows to render
-        # rules as of the last panel render; None = never rendered
+        # rules as of the last Preview; None = never previewed. Drives the stale
+        # marker: when self.rules diverges from this, a refresh is pending.
         self.panel_snapshot: Optional[List[Rule]] = None
-        # when the panel first went out of date; None = up to date. tick() turns
-        # this into a rebuild once typing pauses.
-        self.panel_dirty_at: Optional[float] = None
 
     # --- layout ---
 
@@ -311,32 +328,43 @@ class RuleEditor:
                 dpg.add_text(str(self.rules_path))
                 dpg.add_text("", tag=DIRTY_TXT, color=ACCENT)
                 dpg.add_spacer(width=12)
-                # read-only, so unlike Save it doesn't depend on dirty state —
-                # but with no csv there is nothing to show
-                dpg.add_button(label="Preview", tag=PREVIEW_BTN, width=100,
-                               enabled=bool(self.rows), callback=self.toggle_panel)
+                # A manual refresh of the always-visible panel, not a toggle:
+                # the panel shows the last previewed snapshot until this is
+                # clicked. Read-only, so unlike Save it ignores dirty state —
+                # but with no csv there is nothing to preview.
+                dpg.add_button(label="Preview", tag=PREVIEW_BTN, width=110,
+                               enabled=bool(self.rows), callback=self.refresh_preview)
                 dpg.add_button(label="Save", tag=SAVE_BTN, width=90, enabled=False,
                                callback=self.save)
                 dpg.bind_item_theme(SAVE_BTN, self.accent)
             dpg.add_separator()
             with dpg.group(horizontal=True):
-                # negative height = fill the window minus the footer; scrolls itself
-                dpg.add_child_window(tag=RULES_BOX, width=-1, height=-38, border=False)
-                with dpg.child_window(tag=PANEL, width=PANEL_W, height=-38, show=False):
-                    # horizontal_scrollbar: the tab strip scrolls sideways when
-                    # there are more categories than fit; the content area below
-                    # holds only the active tab's table.
+                # the rules column yields the panel's width plus the gap whenever
+                # the panel is shown (i.e. whenever a csv is loaded)
+                rules_w = -(PANEL_W + 8) if self.panel_shown else -1
+                dpg.add_child_window(tag=RULES_BOX, width=rules_w, height=-38, border=False)
+                with dpg.child_window(tag=PANEL, width=PANEL_W, height=-38,
+                                      show=self.panel_shown):
+                    # the strip holds the two fixed tab buttons + the Categories
+                    # combo; the content area below holds only the active table
                     dpg.add_child_window(tag=PANEL_TABSTRIP, height=TABSTRIP_H,
-                                         horizontal_scrollbar=True, border=False)
+                                         border=False)
                     dpg.add_child_window(tag=PANEL_CONTENT, height=-1, border=False)
             dpg.add_text("", tag=FOOTER_TXT, color=MUTED)
         dpg.set_primary_window(MAIN, True)
         self.render()
+        # populate the panel's initial snapshot so it isn't blank on launch
+        self._render_panel()
 
     # --- rendering ---
 
     def render(self, *_) -> None:
-        """Rebuild every card from the model. Called only on structural edits."""
+        """Rebuild every card from the model. Called only on structural edits.
+
+        This deliberately does NOT refresh the panel: the panel is a snapshot
+        the user refreshes with Preview, so no edit — structural or typed —
+        rebuilds it. refresh() only updates the dirty state and the stale marker.
+        """
         dpg.delete_item(RULES_BOX, children_only=True)
         self.count_tags = []
 
@@ -344,9 +372,6 @@ class RuleEditor:
             self._render_rule(i, rule)
 
         dpg.add_button(label="+ rule", parent=RULES_BOX, callback=self.add_rule, width=110)
-        # structural edits and saves land here, so the panel follows them for
-        # free; only typing leaves it stale (see _refresh_stale)
-        self._render_panel()
         self.refresh()
 
     def _schedule_render(self) -> None:
@@ -419,25 +444,19 @@ class RuleEditor:
 
     # --- transactions panel ---
 
-    def toggle_panel(self, *_) -> None:
-        self.panel_open = not self.panel_open
-        dpg.configure_item(PANEL, show=self.panel_open)
-        # the rules column gives up exactly the panel's width plus the gap
-        dpg.configure_item(RULES_BOX, width=-(PANEL_W + 8) if self.panel_open else -1)
-        if self.panel_open:
-            self._render_panel()
+    def refresh_preview(self, *_) -> None:
+        """Recompute the panel against the current rules. The Preview button.
+
+        This is the only thing that rebuilds the panel — editing rules never
+        does. It resnapshots, which clears the stale marker via refresh().
+        """
+        self._render_panel()
         self.refresh()
 
     def tick(self) -> None:
-        """Called once per frame from the render loop. Fires the debounce."""
+        """Called once per frame from the render loop; drives first-frame calibration."""
         if not self.calibrated:
             self._calibrate()
-        if self.panel_dirty_at is None:
-            return
-        if time.perf_counter() - self.panel_dirty_at < PANEL_DEBOUNCE_S:
-            return
-        self.panel_dirty_at = None
-        self._render_panel()
 
     def _tab_specs(self) -> List[Tuple[str, str, List]]:
         """(key, label, entries) for every tab, in display order."""
@@ -454,29 +473,53 @@ class RuleEditor:
         return specs
 
     def _render_panel(self) -> None:
-        if not self.panel_open:
+        if not self.rows:
             return
         specs = self._tab_specs()
         self.tab_entries = {key: rows for key, _, rows in specs}
         keys = [key for key, _, _ in specs]
-        # the active tab can vanish when a category stops existing
+        # the active category tab can vanish when its category stops existing
         if self.active_tab not in keys:
             self.active_tab = keys[0]
 
-        # rebuild the tab strip: one button per tab in a horizontal row that
-        # overflows into the strip's own horizontal scrollbar
+        # the two fixed tabs are buttons; the categories (already alphabetical)
+        # collapse into one dropdown so ~20 of them stay navigable
+        fixed = specs[:2]     # Changed, Uncategorized
+        cats = specs[2:]
+
         dpg.delete_item(PANEL_TABSTRIP, children_only=True)
         self.tab_buttons = {}
+        self.cat_combo = None
+        self.cat_choice_keys = {}
         with dpg.group(horizontal=True, parent=PANEL_TABSTRIP):
-            for key, label, _ in specs:
-                btn = dpg.add_button(label=label, user_data=key, callback=self._on_tab)
-                dpg.bind_item_theme(
-                    btn, self.tab_active if key == self.active_tab else self.tab_inactive)
-                self.tab_buttons[key] = btn
+            for key, label, _ in fixed:
+                self.tab_buttons[key] = dpg.add_button(
+                    label=label, user_data=key, callback=self._on_tab)
+            if cats:
+                # combo label -> tab key, so the callback maps a selection back
+                # without parsing the " (n)" count off the label
+                self.cat_choice_keys = {label: key for key, label, _ in cats}
+                # show the active category's label if a category is active,
+                # otherwise a bare "Categories" prompt
+                active_label = next((lbl for k, lbl, _ in cats if k == self.active_tab),
+                                    "Categories")
+                self.cat_combo = dpg.add_combo(
+                    items=[lbl for _, lbl, _ in cats], default_value=active_label,
+                    width=200, callback=self._on_cat_select)
 
+        self._paint_tabs()
         self._render_content()
         self.panel_snapshot = copy.deepcopy(self.rules)
-        self.panel_dirty_at = None
+
+    def _paint_tabs(self) -> None:
+        """Active theme on the strip element for the active tab, inactive on the rest."""
+        for key, btn in self.tab_buttons.items():
+            dpg.bind_item_theme(
+                btn, self.tab_active if key == self.active_tab else self.tab_inactive)
+        if self.cat_combo is not None:
+            cat_active = self.active_tab.startswith(CAT_PREFIX)
+            dpg.bind_item_theme(
+                self.cat_combo, self.combo_active if cat_active else self.combo_inactive)
 
     def _render_content(self) -> None:
         # Only the active tab's table exists at a time. dpg's table clipper skips
@@ -489,13 +532,19 @@ class RuleEditor:
     def _on_tab(self, sender, app_data, user_data) -> None:
         if user_data == self.active_tab:
             return
-        # Only re-theme the two affected buttons and swap the content — never
-        # rebuild the strip here, which would delete the button mid-callback.
-        prev = self.tab_buttons.get(self.active_tab)
-        if prev is not None:
-            dpg.bind_item_theme(prev, self.tab_inactive)
-        dpg.bind_item_theme(sender, self.tab_active)
+        # Repaint the strip and swap the content — never rebuild the strip here,
+        # which would delete the button mid-callback. Switching tabs reads the
+        # already-computed tab_entries, so it never sneaks in a live refresh.
         self.active_tab = user_data
+        self._paint_tabs()
+        self._render_content()
+
+    def _on_cat_select(self, sender, app_data, user_data) -> None:
+        key = self.cat_choice_keys.get(app_data)
+        if key is None or key == self.active_tab:
+            return
+        self.active_tab = key
+        self._paint_tabs()
         self._render_content()
 
     def _columns(self, key: str) -> List[Tuple[str, float]]:
@@ -553,14 +602,15 @@ class RuleEditor:
                             with dpg.tooltip(txt):
                                 dpg.add_text(cell, wrap=DESC_TOOLTIP_WRAP)
 
-    def _arm_panel(self) -> None:
-        # Re-arm from the LAST edit, so a burst of typing collapses into one
-        # rebuild once it stops. Structural edits re-render outright and clear
-        # the snapshot, so they never reach here.
-        if not self.panel_open or self.panel_snapshot is None:
+    def _refresh_stale(self) -> None:
+        # The panel is a snapshot from the last Preview. When the rules have
+        # since diverged, flag that a refresh is pending on the Preview button
+        # rather than silently showing stale categories.
+        if not self.panel_shown or self.panel_snapshot is None:
             return
-        if self.rules != self.panel_snapshot:
-            self.panel_dirty_at = time.perf_counter()
+        stale = self.rules != self.panel_snapshot
+        dpg.configure_item(PREVIEW_BTN, label="Preview ●" if stale else "Preview")
+        dpg.bind_item_theme(PREVIEW_BTN, self.accent if stale else 0)
 
     # --- model edits (no re-render: keep focus while typing) ---
 
@@ -612,12 +662,16 @@ class RuleEditor:
         return self.rules != self.baseline
 
     def refresh(self) -> None:
-        """Update dirty state + match counts. Never rebuilds widgets."""
+        """Update dirty state, match counts, and the panel's stale marker.
+
+        Never rebuilds widgets: the rule cards and the panel are left as they
+        are — only labels, Save's enabled-state, and the stale marker change.
+        """
         dirty = self.is_dirty()
         dpg.set_value(DIRTY_TXT, "* unsaved" if dirty else "")
         dpg.configure_item(SAVE_BTN, enabled=dirty)
         self._refresh_counts()
-        self._arm_panel()
+        self._refresh_stale()
 
     def _refresh_counts(self) -> None:
         if not self.rows:

@@ -64,13 +64,15 @@ def uncategorized(entries: List[PreviewEntry]) -> List[PreviewEntry]:
 
 
 def group_by_category(entries: List[PreviewEntry]) -> List[Tuple[str, List[PreviewEntry]]]:
-    """Categorized rows grouped by category, biggest group first.
+    """Categorized rows grouped by category, sorted alphabetically by name.
 
-    Ties break on name so tab order is stable between refreshes — otherwise
-    two equal-sized categories could swap places on every keystroke.
+    The editor lists these in a Categories dropdown, and with ~20 hierarchical
+    `<main>/<sub>` names alphabetical is what you can scan. casefold() so
+    `Food/Dining` and `food/snacks` order naturally; alphabetical order is also
+    inherently stable, so the group order never reshuffles between refreshes.
     """
     groups: Dict[str, List[PreviewEntry]] = {}
     for entry in entries:
         if entry.new is not None:
             groups.setdefault(entry.new, []).append(entry)
-    return sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    return sorted(groups.items(), key=lambda kv: kv[0].casefold())
