@@ -42,7 +42,7 @@ in `scripts/resolve_batch.py`; this library knows nothing about the data root.
 from dataclasses import replace
 from typing import Callable, List, Optional
 
-from resolve_lookup import Lookup
+from resolve_lookup import CategoryLookup, Lookup
 from resolve_review import (BY_AGENT, BY_CAT_MAP, BY_DESC_MAP, BY_HARD, BY_NONE,
                             ReviewRow)
 from rules import Rule, categorize_row
@@ -62,7 +62,7 @@ class Resolver:
     """Resolves unmatched transactions via the persisted maps (+ agent, later)."""
 
     def __init__(self, rules: List[Rule], description_map: Lookup,
-                 category_map: Lookup, agent: Optional[Agent] = None):
+                 category_map: CategoryLookup, agent: Optional[Agent] = None):
         self._rules = rules
         self._description_map = description_map
         self._category_map = category_map
@@ -103,8 +103,8 @@ class Resolver:
             # keep the fix, but no rule caught it yet — fall through
             txn = replace(txn, corrected_description=corrected)
 
-        # path 2 — category map -> direct category
-        category = self._category_map.get(txn.original_description)
+        # path 2 — category map -> direct category (amount-aware)
+        category = self._category_map.get(txn.original_description, txn.amount)
         if category is not None:
             return ReviewRow(
                 replace(txn, category=category,

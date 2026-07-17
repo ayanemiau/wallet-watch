@@ -29,8 +29,8 @@ import re  # noqa: E402
 from datetime import datetime  # noqa: E402
 from typing import List  # noqa: E402
 
-from resolve_lookup import Lookup  # noqa: E402
-from resolve_review import ReviewRow, write_review  # noqa: E402
+from resolve_lookup import build_lookup  # noqa: E402
+from resolve_review import ReviewRow, read_review, write_review  # noqa: E402
 from resolver import Resolver  # noqa: E402
 from rules import load_rules  # noqa: E402
 from schema import Transaction, from_row  # noqa: E402
@@ -103,6 +103,36 @@ def read_transactions(path: Path) -> List[Transaction]:
         return [from_row(row) for row in csv.DictReader(fh)]
 
 
+def read_history(data_dir: Path) -> List[Transaction]:
+    """Categorized history the maps learn from, oldest -> newest.
+
+    1. the committed year store `categorized/<year>.csv` (year-ordered);
+    2. then the approved rows of the latest `review_*.csv` per batch, in
+       chronological (stamp) order — the most recent categorizations, so a fresh
+       edit wins. Until a commit step exists this is how approvals feed the maps.
+    """
+    history: List[Transaction] = []
+
+    year_store = data_dir / "categorized"
+    if year_store.is_dir():
+        for path in sorted(year_store.glob("*.csv")):
+            history.extend(read_transactions(path))
+
+    batch_root = data_dir / "batch"
+    if batch_root.is_dir():
+        latest_per_batch = []
+        for batch in batch_root.iterdir():
+            if not (batch.is_dir() and BATCH_ID_RE.fullmatch(batch.name)):
+                continue
+            reviews = sorted(batch.glob("review_*.csv"))
+            if reviews:
+                latest_per_batch.append(reviews[-1])          # newest run in that batch
+        for review in sorted(latest_per_batch, key=lambda p: p.name):  # stamp ascending
+            history.extend(row.txn for row in read_review(review) if row.approved)
+
+    return history
+
+
 def main() -> None:
     args = parse_args()
     data_dir = resolve_data_dir(args.data_dir)
@@ -118,8 +148,14 @@ def main() -> None:
     lookup_dir = data_dir / "lookup"
 
     rules = load_rules(rules_path)   # missing file -> [] (first run)
-    description_map = Lookup.load(lookup_dir / DESCRIPTION_MAP)
-    category_map = Lookup.load(lookup_dir / CATEGORY_MAP)
+    # learn the maps from history (committed store + approved review rows), then
+    # persist them under lookup/ for inspection (they are outputs, not inputs).
+    history = read_history(data_dir)
+    description_map, category_map = build_lookup(history)
+    description_map.save(lookup_dir / DESCRIPTION_MAP)
+    category_map.save(lookup_dir / CATEGORY_MAP)
+    print(f"learned from {len(history)} history rows -> {len(category_map)} category "
+          f"+ {len(description_map)} description entries", file=sys.stderr)
 
     transactions = read_transactions(input_path)
     rows: List[ReviewRow] = Resolver(rules, description_map,
