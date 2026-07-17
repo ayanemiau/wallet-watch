@@ -271,6 +271,8 @@ class ReviewApprover:
         self.ac_target: Optional[Tuple[int, str]] = None  # (master idx, field name)
         self.ac_query: Optional[str] = None               # last-seen text, for change detection
         self.ac_shown = False                             # is the dropdown currently visible
+        self.ac_pos: Optional[Tuple[int, int]] = None     # where we placed it (viewport coords)
+        self.ac_grace: Optional[int] = None               # frame to auto-close at after a blur
         self.ac_registries: List[int] = []                # per-input focus handler registries
 
     # --- tab membership -------------------------------------------------
@@ -436,10 +438,13 @@ class ReviewApprover:
             return
         self.ac_input = item
         self.ac_target = (idx, field)
-        # anchor the dropdown just under the focused input
+        # anchor the dropdown just under the focused input, and remember where we
+        # put it — the hit-test reads this, never the window's (fragile) render state.
         x, y = dpg.get_item_rect_min(item)
         h = dpg.get_item_rect_size(item)[1]
-        dpg.configure_item(SUGGEST, pos=[int(x), int(y + h)])
+        self.ac_pos = (int(x), int(y + h))
+        self.ac_grace = None
+        dpg.configure_item(SUGGEST, pos=list(self.ac_pos))
         value = dpg.get_value(item)
         self.ac_query = value
         self._ac_populate(value)
@@ -474,16 +479,30 @@ class ReviewApprover:
         self.ac_target = None
         self.ac_query = None
         self.ac_shown = False
+        self.ac_pos = None
+        self.ac_grace = None
 
-    def _mouse_in_suggest(self) -> bool:
-        # keeps the list open while the mouse is over it, so clicking a suggestion
-        # (which blurs the input) doesn't race the tick() dismissal.
+    def _suggest_hovered(self) -> bool:
+        # Keeps the list open while the mouse is over it, so clicking a suggestion
+        # (which blurs the input) doesn't race the tick() dismissal. Deliberately
+        # avoids get_item_rect_min(SUGGEST): a floating window's render state can
+        # lack "rect_min" mid-frame and raise KeyError. Use is_item_hovered (a
+        # plain bool) plus a hit-test against the position we set it to.
         if not self.ac_shown:
             return False
-        mx, my = dpg.get_mouse_pos(local=False)
-        x, y = dpg.get_item_rect_min(SUGGEST)
-        w, h = dpg.get_item_rect_size(SUGGEST)
-        return x <= mx <= x + w and y <= my <= y + h
+        try:
+            if dpg.is_item_hovered(SUGGEST):
+                return True
+        except Exception:
+            pass
+        if self.ac_pos is None:
+            return False
+        try:
+            mx, my = dpg.get_mouse_pos(local=False)
+        except Exception:
+            return False
+        x, y = self.ac_pos
+        return x <= mx <= x + SUGGEST_W and y <= my <= y + SUGGEST_H
 
     # --- selection / approval ------------------------------------------
 
@@ -522,20 +541,29 @@ class ReviewApprover:
         return is_dirty(self.rows, self.baseline)
 
     def tick(self) -> None:
-        # drives the category autocomplete: dismiss when focus leaves (and the
-        # mouse isn't over the list), else refilter as the focused value changes.
+        # drives the category autocomplete each frame.
         if self.ac_input is None:
             return
         if not dpg.does_item_exist(self.ac_input):
             self._ac_close()
             return
-        if not dpg.is_item_focused(self.ac_input) and not self._mouse_in_suggest():
-            self._ac_close()
+        if dpg.is_item_focused(self.ac_input):
+            self.ac_grace = None                       # active input — cancel pending close
+            cur = dpg.get_value(self.ac_input)
+            if cur != self.ac_query:                   # refilter as you type
+                self.ac_query = cur
+                self._ac_populate(cur)
             return
-        cur = dpg.get_value(self.ac_input)
-        if cur != self.ac_query:
-            self.ac_query = cur
-            self._ac_populate(cur)
+        # focus left the input. Keep the list open while the mouse is over it, and
+        # give a few frames' grace so a click on a suggestion (which fires _ac_pick)
+        # lands before we dismiss — avoids closing the list out from under the click.
+        if self._suggest_hovered():
+            self.ac_grace = None
+            return
+        if self.ac_grace is None:
+            self.ac_grace = dpg.get_frame_count() + 6
+        elif dpg.get_frame_count() >= self.ac_grace:
+            self._ac_close()
 
     # --- save / exit ----------------------------------------------------
 
