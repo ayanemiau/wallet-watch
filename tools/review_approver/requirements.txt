@@ -1,0 +1,9 @@
+# Dependencies for tools/review_approver only — the pipeline in lib/ stays stdlib-only.
+#   pip install -r tools/review_approver/requirements.txt
+
+# UI toolkit. Tkinter was the first choice (stdlib, nothing to install), but the
+# Tk 8.5 bundled with macOS system Python cannot open a window on macOS 26+
+# ("macOS 26 or later required, have instead 16"), and fixing that means
+# installing a whole second Python. DearPyGui is a pip wheel that works on the
+# system interpreter as-is. (Same choice as tools/rule_editor.)
+dearpygui>=1.10
