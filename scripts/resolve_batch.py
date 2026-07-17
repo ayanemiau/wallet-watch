@@ -1,11 +1,12 @@
 """Batch orchestrator over the Resolver library (plan.md §6 — Phase 4).
 
-Reads a batch's categorized CSV, takes the rows Phase 3 left unmatched (empty
-category), resolves each via the persisted lookup maps (re-running the rule table
-for path-1 fixes), and writes a run-timestamped review_inbox_<YYYYMMDD>_<HHMMSS>.csv
-beside it. Every unmatched row lands in the inbox with approved=0 for manual
-approval — nothing Phase 4 produces is trusted blindly. Like categorize.py this
-is one orchestrator over the library; the review_approver UI would be another.
+Reads a batch's categorized CSV and writes a run-timestamped
+review_<YYYYMMDD>_<HHMMSS>.csv beside it holding EVERY row: hard-filter hits pass
+through pre-approved (resolved_by=hard), and the rows Phase 3 left unmatched are
+resolved via the persisted lookup maps (re-running the rule table for path-1
+fixes) at approved=0 for manual approval. One review file feeds both approver
+tabs. Like categorize.py this is one orchestrator over the library; the
+review_approver UI is the other.
 
     python3 scripts/resolve_batch.py [--batch-dir <batch>] [--rules <yaml>] \
             [--input <categorized.csv>] --data-dir <root>
@@ -29,8 +30,8 @@ from datetime import datetime  # noqa: E402
 from typing import List  # noqa: E402
 
 from resolve_lookup import Lookup  # noqa: E402
-from resolve_review import InboxRow, write_inbox  # noqa: E402
-from resolver import Resolver, unmatched  # noqa: E402
+from resolve_review import ReviewRow, write_review  # noqa: E402
+from resolver import Resolver  # noqa: E402
 from rules import load_rules  # noqa: E402
 from schema import Transaction, from_row  # noqa: E402
 
@@ -121,23 +122,23 @@ def main() -> None:
     category_map = Lookup.load(lookup_dir / CATEGORY_MAP)
 
     transactions = read_transactions(input_path)
-    todo = unmatched(transactions)
-    rows: List[InboxRow] = Resolver(rules, description_map, category_map).resolve(todo)
+    rows: List[ReviewRow] = Resolver(rules, description_map,
+                                     category_map).resolve_all(transactions)
 
     # timestamp the output so a rerun versions rather than overwrites (run time,
-    # local): review_inbox_<YYYYMMDD>_<HHMMSS>.csv
+    # local): review_<YYYYMMDD>_<HHMMSS>.csv
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = batch_dir / f"review_inbox_{stamp}.csv"
-    write_inbox(out_path, rows)
+    out_path = batch_dir / f"review_{stamp}.csv"
+    write_review(out_path, rows)
 
-    # summarize by source so the operator knows how much is auto-suggested vs
-    # needs a fresh decision (all still require approval).
+    # summarize by source: hard rows are pre-approved; everything else awaits
+    # approval in the review_approver UI.
     from collections import Counter
     by = Counter(r.resolved_by for r in rows)
-    matched = len(transactions) - len(todo)
-    print(f"{matched} already categorized (Phase 3), {len(rows)} unmatched -> inbox: "
-          f"{dict(by)}", file=sys.stderr)
-    print(f"read {input_path.name} -> wrote {out_path} (approve every row before commit)",
+    pending = sum(1 for r in rows if not r.approved)
+    print(f"{len(rows)} rows by source: {dict(by)} ({pending} awaiting approval)",
+          file=sys.stderr)
+    print(f"read {input_path.name} -> wrote {out_path} (approve every non-hard row before commit)",
           file=sys.stderr)
 
 

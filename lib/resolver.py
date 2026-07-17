@@ -4,23 +4,30 @@
 `category`) and tries, per row, two deterministic paths before giving up to a
 human (plan.md §6.1–6.2):
 
-  path 1 (categorize_method=1): the description_map holds a clean rewrite for
-      this merchant. Apply it to `corrected_description`, then re-run the Phase 3
-      rule engine — if a rule now hits, the row is categorized. Preferred: one
+  path 1 (category_source=FILTER_RULES): the description_map holds a clean rewrite
+      for this merchant. Apply it to `corrected_description`, then re-run the Phase
+      3 rule engine — if a rule now hits, the row is categorized (the category came
+      from a filter rule, matched on the updated description). Preferred: one
       description fix lets a keyword rule generalize to every sibling merchant.
 
-  path 2 (categorize_method=2): the category_map holds a category for this
+  path 2 (category_source=DICT_MATCH): the category_map holds a category for this
       merchant outright. Assign it. Used when there is no merchant name to
       recover (a raw memo, a one-off).
 
 description_map wins if both hit; a path-1 fix that still matches no rule keeps
 the corrected description and falls through to path 2, then to manual.
 
-Nothing here is trusted blindly: EVERY input row comes back as an `InboxRow`
+Nothing here is trusted blindly: EVERY unmatched row comes back as a `ReviewRow`
 (approved defaults to False), including map hits, so the operator approves all of
 them (plan.md §6.3). `resolved_by` records which path produced the suggestion so
 the reviewer can triage. The LLM agent (path between the maps and manual) is
 deferred — `agent=` is the seam for it.
+
+`resolve_all` is the orchestrator entry point: it takes the *whole* categorized
+batch and returns one `ReviewRow` per row — already-categorized (hard-filter) rows
+pass through pre-approved (`resolved_by=hard`), unmatched rows go through the paths
+above. The human column `category_override` is never set here — the machine only
+ever writes `category`.
 
 Re-match detail: Phase 3 rules are authored against `original_description` (the
 column a normalized row carries), so to re-match a *corrected* description this
@@ -28,17 +35,18 @@ substitutes the corrected text into `original_description` for the match only �
 the stored Transaction keeps its true `original_description` and records the fix
 in `corrected_description`.
 
-The orchestrator that reads the categorized CSV and writes the inbox lives in
-`scripts/resolve_batch.py`; this library knows nothing about the data root.
+The orchestrator that reads the categorized CSV and writes the review file lives
+in `scripts/resolve_batch.py`; this library knows nothing about the data root.
 """
 
 from dataclasses import replace
 from typing import Callable, List, Optional
 
 from resolve_lookup import Lookup
-from resolve_review import (BY_AGENT, BY_CAT_MAP, BY_DESC_MAP, BY_NONE, InboxRow)
+from resolve_review import (BY_AGENT, BY_CAT_MAP, BY_DESC_MAP, BY_HARD, BY_NONE,
+                            ReviewRow)
 from rules import Rule, categorize_row
-from schema import Transaction, to_row
+from schema import CategorySource, Transaction, to_row
 
 # An agent proposes a (corrected_description, category) for a still-unmatched row.
 # Either element may be None. Deferred (plan.md §6.2 / M7) — the type is the seam.
@@ -60,19 +68,37 @@ class Resolver:
         self._category_map = category_map
         self._agent = agent
 
-    def resolve(self, transactions: List[Transaction]) -> List[InboxRow]:
-        """One `InboxRow` (approved=False) per input row, in order."""
+    def resolve(self, transactions: List[Transaction]) -> List[ReviewRow]:
+        """One `ReviewRow` (approved=False) per input row, in order.
+
+        Assumes every input row is unmatched; use `resolve_all` for a full batch.
+        """
         return [self._resolve_one(txn) for txn in transactions]
 
-    def _resolve_one(self, txn: Transaction) -> InboxRow:
+    def resolve_all(self, transactions: List[Transaction]) -> List[ReviewRow]:
+        """One `ReviewRow` per row of a full categorized batch, in order.
+
+        Already-categorized (hard-filter) rows pass through pre-approved
+        (`resolved_by=hard`); unmatched rows go through the resolve paths at
+        `approved=False`. This is what the orchestrator feeds the review file.
+        """
+        out: List[ReviewRow] = []
+        for txn in transactions:
+            if txn.category:
+                out.append(ReviewRow(txn, resolved_by=BY_HARD, approved=True))
+            else:
+                out.append(self._resolve_one(txn))
+        return out
+
+    def _resolve_one(self, txn: Transaction) -> ReviewRow:
         # path 1 — description map -> corrected description -> re-run rules
         corrected = self._description_map.get(txn.original_description)
         if corrected is not None:
             category = self._rematch(txn, corrected)
             if category is not None:
-                return InboxRow(
-                    replace(txn, corrected_description=corrected,
-                            category=category, categorize_method=1),
+                return ReviewRow(
+                    replace(txn, corrected_description=corrected, category=category,
+                            category_source=CategorySource.FILTER_RULES),
                     resolved_by=BY_DESC_MAP)
             # keep the fix, but no rule caught it yet — fall through
             txn = replace(txn, corrected_description=corrected)
@@ -80,8 +106,9 @@ class Resolver:
         # path 2 — category map -> direct category
         category = self._category_map.get(txn.original_description)
         if category is not None:
-            return InboxRow(
-                replace(txn, category=category, categorize_method=2),
+            return ReviewRow(
+                replace(txn, category=category,
+                        category_source=CategorySource.DICT_MATCH),
                 resolved_by=BY_CAT_MAP)
 
         # agent (deferred): propose, never adopt — the operator confirms in review
@@ -91,7 +118,7 @@ class Resolver:
                 return proposed
 
         # nothing matched: the operator fills in category / corrected_description
-        return InboxRow(txn, resolved_by=BY_NONE)
+        return ReviewRow(txn, resolved_by=BY_NONE)
 
     def _rematch(self, txn: Transaction, corrected: str) -> Optional[str]:
         # rules target original_description; feed the corrected text there so an
@@ -99,22 +126,24 @@ class Resolver:
         row = to_row(replace(txn, original_description=corrected))
         return categorize_row(self._rules, row)
 
-    def _apply_agent(self, txn: Transaction) -> Optional[InboxRow]:
+    def _apply_agent(self, txn: Transaction) -> Optional[ReviewRow]:
         proposal = self._agent(txn)
         if proposal is None:
             return None
-        # path-1-style proposal: a corrected description, re-matched by rules
+        # path-1-style proposal: a corrected description, re-matched by rules —
+        # the category comes from a filter rule (matched on the updated desc)
         if proposal.corrected_description:
             category = self._rematch(txn, proposal.corrected_description)
             if category is not None:
-                return InboxRow(
+                return ReviewRow(
                     replace(txn, corrected_description=proposal.corrected_description,
-                            category=category, categorize_method=1),
+                            category=category, category_source=CategorySource.FILTER_RULES),
                     resolved_by=BY_AGENT)
-        # path-2-style proposal: a category outright
+        # path-2-style proposal: a category the LLM labelled outright
         if proposal.category:
-            return InboxRow(
-                replace(txn, category=proposal.category, categorize_method=2),
+            return ReviewRow(
+                replace(txn, category=proposal.category,
+                        category_source=CategorySource.LLM_LABEL),
                 resolved_by=BY_AGENT)
         return None
 

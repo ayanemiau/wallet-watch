@@ -19,7 +19,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from categorizer import CATEGORIZER_VERSION, Categorizer  # noqa: E402
 from rules import Condition, Rule, save_rules  # noqa: E402
-from schema import Transaction  # noqa: E402
+from schema import CategorySource, Transaction  # noqa: E402
 
 
 def txn(**kw) -> Transaction:
@@ -55,12 +55,14 @@ def test_unmatched_row_keeps_empty_category(tmp_path):
     assert result.category == ""
 
 
-def test_hard_filter_hit_stamps_method_zero(tmp_path):
-    # a rule match is the Phase 3 hard filter (plan.md §6.4): categorize_method=0
+def test_hard_filter_hit_stamps_filter_rules(tmp_path):
+    # a rule match is the Phase 3 hard filter (plan.md §6.4): category_source
+    # becomes FILTER_RULES, overwriting any prior source on the input row
     cfg = write_rules(tmp_path, [coffee_rule()])
-    (result,) = Categorizer().apply_rules([txn(categorize_method=2)], cfg)
+    (result,) = Categorizer().apply_rules(
+        [txn(category_source=CategorySource.DICT_MATCH)], cfg)
     assert result.category == "Coffee"
-    assert result.categorize_method == 0
+    assert result.category_source is CategorySource.FILTER_RULES
 
 
 def test_first_matching_rule_wins(tmp_path):
@@ -104,9 +106,10 @@ def test_other_columns_unchanged(tmp_path):
                    tags=["trip"], category="")
     (result,) = Categorizer().apply_rules([original], cfg)
     assert result.category == "Coffee"
-    # every other field identical to the input
+    # a hit sets only category + category_source; every other field is identical
     from dataclasses import replace
-    assert replace(result, category="") == original
+    assert replace(result, category="",
+                   category_source=CategorySource.NONE) == original
 
 
 def test_input_transactions_not_mutated(tmp_path):

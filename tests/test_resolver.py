@@ -7,10 +7,10 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "lib"))
 
 from resolve_lookup import Lookup  # noqa: E402
-from resolve_review import BY_CAT_MAP, BY_DESC_MAP, BY_NONE  # noqa: E402
+from resolve_review import BY_CAT_MAP, BY_DESC_MAP, BY_HARD, BY_NONE  # noqa: E402
 from resolver import Resolver, unmatched  # noqa: E402
 from rules import Condition, Rule  # noqa: E402
-from schema import Transaction  # noqa: E402
+from schema import CategorySource, Transaction  # noqa: E402
 
 
 def txn(desc="SQ *BLUE BOTTLE #99", category="", **kw) -> Transaction:
@@ -41,12 +41,12 @@ def cat_map(desc="ZELLE TO SAM 8842", value="Transfers") -> Lookup:
 # --- path 1: updated description, re-matched by rules ---
 
 
-def test_description_map_hit_rematches_to_method_1():
+def test_description_map_hit_rematches_to_filter_rules():
     r = Resolver(coffee_rules(), desc_map(), Lookup())
     (row,) = r.resolve([txn()])
     assert row.resolved_by == BY_DESC_MAP
     assert row.txn.category == "Coffee"
-    assert row.txn.categorize_method == 1
+    assert row.txn.category_source is CategorySource.FILTER_RULES
     assert row.txn.corrected_description == "Blue Bottle Coffee"
     assert row.txn.original_description == "SQ *BLUE BOTTLE #99"   # unchanged
     assert row.approved is False                                  # always needs approval
@@ -59,18 +59,18 @@ def test_description_map_hit_but_no_rule_falls_through():
     assert row.resolved_by == BY_NONE
     assert row.txn.corrected_description == "Blue Bottle Coffee"  # fix kept
     assert row.txn.category == ""
-    assert row.txn.categorize_method == 0
+    assert row.txn.category_source is CategorySource.NONE
 
 
 # --- path 2: direct category ---
 
 
-def test_category_map_hit_is_method_2():
+def test_category_map_hit_is_dict_match():
     r = Resolver(coffee_rules(), Lookup(), cat_map())
     (row,) = r.resolve([txn(desc="ZELLE TO SAM 0001")])
     assert row.resolved_by == BY_CAT_MAP
     assert row.txn.category == "Transfers"
-    assert row.txn.categorize_method == 2
+    assert row.txn.category_source is CategorySource.DICT_MATCH
     assert row.approved is False
 
 
@@ -89,7 +89,7 @@ def test_desc_map_no_rule_then_falls_to_category_map():
     (row,) = Resolver([], dm, cm).resolve([txn()])
     assert row.resolved_by == BY_CAT_MAP
     assert row.txn.category == "Coffee"
-    assert row.txn.categorize_method == 2
+    assert row.txn.category_source is CategorySource.DICT_MATCH
     assert row.txn.corrected_description == "Bluebottle"          # path-1 fix still kept
 
 
@@ -107,7 +107,7 @@ def test_inputs_not_mutated():
     Resolver(coffee_rules(), desc_map(), Lookup()).resolve([original])
     assert original.category == ""
     assert original.corrected_description == ""
-    assert original.categorize_method == 0
+    assert original.category_source is CategorySource.NONE
 
 
 def test_order_preserved_and_one_row_out_per_row_in():
@@ -123,3 +123,36 @@ def test_order_preserved_and_one_row_out_per_row_in():
 def test_unmatched_filters_out_categorized_rows():
     rows = [txn(category="Coffee"), txn(desc="MYSTERY LLC"), txn(category="Rent")]
     assert [t.original_description for t in unmatched(rows)] == ["MYSTERY LLC"]
+
+
+# --- resolve_all (full batch: hard rows pass through pre-approved) ---
+
+
+def test_resolve_all_passes_hard_rows_through_pre_approved():
+    r = Resolver(coffee_rules(), Lookup(), Lookup())
+    hard = txn(desc="STARBUCKS", category="Coffee",
+               category_source=CategorySource.FILTER_RULES)
+    (row,) = r.resolve_all([hard])
+    assert row.resolved_by == BY_HARD
+    assert row.approved is True
+    assert row.txn.category == "Coffee"                            # untouched
+    assert row.txn.category_source is CategorySource.FILTER_RULES  # preserved
+
+
+def test_resolve_all_interleaves_and_preserves_order():
+    rows = [
+        txn(desc="STARBUCKS", category="Coffee"),   # hard
+        txn(desc="SQ *BLUE BOTTLE #1"),             # desc-map -> Coffee
+        txn(desc="ZELLE TO SAM 5"),                 # cat-map -> Transfers
+        txn(desc="MYSTERY LLC"),                    # none
+    ]
+    out = Resolver(coffee_rules(), desc_map(), cat_map()).resolve_all(rows)
+    assert [r.resolved_by for r in out] == [BY_HARD, BY_DESC_MAP, BY_CAT_MAP, BY_NONE]
+    assert [r.approved for r in out] == [True, False, False, False]
+
+
+def test_resolver_never_sets_category_override():
+    rows = [txn(desc="STARBUCKS", category="Coffee"), txn(desc="SQ *BLUE BOTTLE #1"),
+            txn(desc="ZELLE 5"), txn(desc="MYSTERY LLC")]
+    out = Resolver(coffee_rules(), desc_map(), cat_map()).resolve_all(rows)
+    assert all(r.txn.category_override == "" for r in out)

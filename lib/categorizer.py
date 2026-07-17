@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import List
 
 from rules import categorize_row, load_rules
-from schema import Transaction, to_row
+from schema import CategorySource, Transaction, to_row
 
 # The categorizer carries a version (plan.md §5): output-schema changes must stay
 # backward compatible so committed batches can be re-run with a newer version.
@@ -51,9 +51,13 @@ class Categorizer:
         for txn in transactions:
             # to_row yields the exact Dict[str, str] shape the engine (and the
             # editor's preview) matches against — same columns, same encoding.
+            # TODO: match the updated description (corrected_description) instead
+            # of original_description when it is non-empty, so a committed
+            # correction is honored on backfill/re-run (plan.md §6.1 path 1).
             category = categorize_row(rules, to_row(txn))
-            # a hit is the hard filter: stamp categorize_method=0 (plan.md §6.4).
+            # a hit is the hard filter: stamp category_source=FILTER_RULES.
             # a miss leaves the row untouched (empty category) — Phase 4's input.
             result.append(txn if category is None
-                          else replace(txn, category=category, categorize_method=0))
+                          else replace(txn, category=category,
+                                       category_source=CategorySource.FILTER_RULES))
         return result

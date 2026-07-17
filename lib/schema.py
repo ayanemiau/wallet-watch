@@ -9,7 +9,24 @@ NEVER put a real account number in this file — use placeholder labels
 """
 
 from dataclasses import dataclass, field, fields
+from enum import Enum
 from typing import Dict, List
+
+
+class CategorySource(str, Enum):
+    """Where a transaction's `category` came from (plan.md §6.4).
+
+    kebab-case string values, consistent with the codebase's other tokens
+    (account types like `chase-checking`, and the sibling `resolved_by` values
+    `desc-map`/`cat-map`). Member names stay UPPER_SNAKE; only the on-disk value
+    is kebab. An empty `category` is `NONE`.
+    """
+
+    NONE = ""                    # no category yet (uncategorized) — the default
+    FILTER_RULES = "filter-rules"  # hard-filter rule match (original OR updated description)
+    DICT_MATCH = "dict-match"    # learned from prior categories, via dict/lookup match
+    LLM_LABEL = "llm-label"      # learned from prior categories, via the LLM agent
+    HUMAN_REVIEW = "human-review"  # entered by a human in Phase 4 review (≠ category_override)
 
 
 @dataclass
@@ -41,16 +58,24 @@ class Transaction:
 
     # --- For labelled transactions only ---
 
-    # the category of the transaction
+    # the category of the transaction — the LEARNABLE value. Machine-set first
+    # (Phase 3 hard filter, then Phase 4 dict/LLM), then correctable by a human in
+    # Phase 4 review. This is the column dict-match and the LLM reuse to label
+    # future transactions, so a human correction here is training signal (learned
+    # via committed history, not a writeback — see plan.md §6.3).
     category: str = ""
 
-    # how the category was assigned (plan.md §6.4):
-    #   0 = Phase 3 hard filter (rule table)
-    #   1 = Phase 4 updated description (corrected_description re-matched by rules)
-    #   2 = Phase 4 manually entered / mapped category
-    # Defaults to 0: a fresh normalized row (no category yet) carries 0, and so
-    # does a Phase 3 hard-filter hit.
-    categorize_method: int = 0
+    # a human's ONE-OFF category override (Phase 4 review). Empty = no override.
+    # A separate layer from `category` for a transaction that must be treated
+    # specially: it wins downstream (`effective_category = category_override or
+    # category`) but is NEVER learned — it must not seed the maps/LLM. Editing it
+    # (like `category`) never touches a raw field, so raw data stays immutable.
+    category_override: str = ""
+
+    # where `category` came from — see CategorySource. NONE ("") when there is no
+    # category yet; FILTER_RULES / DICT_MATCH / LLM_LABEL for the machine paths;
+    # HUMAN_REVIEW when a human set it in review (distinct from category_override).
+    category_source: CategorySource = CategorySource.NONE
 
     # tags of the transaction
     tags: List[str] = field(default_factory=list)
@@ -121,18 +146,19 @@ def decode_bool(raw: str) -> bool:
     raise ValueError(f"expected 1 or 0, got {raw!r}")
 
 
-def encode_method(value: int) -> str:
-    return str(value)
+def encode_source(source: CategorySource) -> str:
+    # explicit .value: `str(CategorySource.X)` is the member repr on some Python
+    # versions, not the kebab value we persist.
+    return source.value
 
 
-def decode_method(raw: str) -> int:
-    # an older CSV without the column reads as 0 (the default / hard-filter code)
-    if raw == "":
-        return 0
+def decode_source(raw: str) -> CategorySource:
+    # "" (or a missing column) is NONE; an unknown token is a hard error rather
+    # than a silent NONE, so a typo in a hand-edited CSV surfaces.
     try:
-        return int(raw)
+        return CategorySource(raw)
     except ValueError:
-        raise ValueError(f"expected an integer categorize_method, got {raw!r}")
+        raise ValueError(f"unknown category_source: {raw!r}")
 
 
 def to_row(txn: Transaction) -> Dict[str, str]:
@@ -144,7 +170,8 @@ def to_row(txn: Transaction) -> Dict[str, str]:
         "original_description": txn.original_description,
         "corrected_description": txn.corrected_description,
         "category": txn.category,
-        "categorize_method": encode_method(txn.categorize_method),
+        "category_override": txn.category_override,
+        "category_source": encode_source(txn.category_source),
         "tags": encode_tags(txn.tags),
     }
 
@@ -160,6 +187,17 @@ def from_row(row: Dict[str, str]) -> Transaction:
         original_description=row.get("original_description", ""),
         corrected_description=row.get("corrected_description", ""),
         category=row.get("category", ""),
-        categorize_method=decode_method(row.get("categorize_method", "")),
+        category_override=row.get("category_override", ""),
+        category_source=decode_source(row.get("category_source", "")),
         tags=decode_tags(row.get("tags", "")),
     )
+
+
+def effective_category(txn: Transaction) -> str:
+    """The category to use downstream: a human override wins over the machine's.
+
+    Charts/commit read this, not `category` directly, so a `category_override`
+    transparently supersedes whatever the pipeline categorized (including a
+    hard-filter match) without mutating machine output.
+    """
+    return txn.category_override or txn.category
