@@ -55,6 +55,14 @@ def test_unmatched_row_keeps_empty_category(tmp_path):
     assert result.category == ""
 
 
+def test_hard_filter_hit_stamps_method_zero(tmp_path):
+    # a rule match is the Phase 3 hard filter (plan.md §6.4): categorize_method=0
+    cfg = write_rules(tmp_path, [coffee_rule()])
+    (result,) = Categorizer().apply_rules([txn(categorize_method=2)], cfg)
+    assert result.category == "Coffee"
+    assert result.categorize_method == 0
+
+
 def test_first_matching_rule_wins(tmp_path):
     cfg = write_rules(tmp_path, [
         coffee_rule(category="Coffee", value="FAKE"),

@@ -9,15 +9,15 @@ Design principles:
 - **80/20 split**: the vast majority of transactions go through deterministic tag/rule matching; only the semantically fuzzy minority (mostly e-commerce shopping) launches the LLM.
 - **Idempotent within a batch; guarded at commit**: each in-batch step is "read input file → write output file" and re-running it just overwrites its own batch output. Commit is a plain append to the year store (no automatic dedup — identical transactions can legitimately recur), guarded by a **date-conflict check**: if the year store already holds rows for a date in the batch, warn and require the operator to confirm before appending. After changing the categorization method, raw batches can be backfilled and re-run end to end.
 - **Raw is source of truth**: Phase 1 raw data is read-only and immutable; later stages only derive from it and never write back to the raw layer.
-- **LLM results are cacheable & auditable**: LLM calls are cached by content hash; low-confidence items go to `review_inbox` for a human pass.
-- **Privacy first**: financial data is processed locally by default; only 3c's fuzzy categorization sends the *redacted transaction description* to the LLM — amounts/account numbers never leave the machine.
+- **LLM results are cacheable & auditable**: LLM calls are cached by content hash; and in Phase 4 every non-hard-matched item (agent-proposed or not) goes to `review_inbox` for a human pass — nothing outside the Phase 3 hard filter is committed unreviewed.
+- **Privacy first**: financial data is processed locally by default; only Phase 4's agent step sends the *redacted transaction description* to the LLM — amounts/account numbers never leave the machine.
 - **Code and data are strictly separated**: this repository holds **infra code only**. All real data — transactions, account info, exports, rules, indexes, caches — lives in a *separate private location* chosen by the pipeline operator (a private data repo, an encrypted local dir, etc.). Nothing that could reveal real financial activity is ever committed here. See [§2.1 Data Location](#21-data-location--separation).
 
 ### Decisions
 
 - **Stack: Python** (confirmed) + `lib/schema.py` (dataclasses as the canonical schema). Layered data is persisted as JSONL/CSV; the volume is small (2023 ≈ 1300 rows, 2022 ≈ 900 rows), so no database is needed.
 - **Schema format: plain dataclasses, not protobuf** (revised). The model started as `schema.proto`, but protobuf earned nothing here: every field is a `string` (so its type system bought no validation), there is no RPC, no cross-language consumer, and no binary serialization — everything persists as CSV text. That left a documented field list behind a `protoc` toolchain and a codegen step. The dataclasses in `lib/schema.py` *are* the schema; field names map one-to-one onto CSV column headers, so no second schema format is needed. Schema evolution is "append a column, tolerate missing ones on read".
-- **LLM provider: deferred.** We build the non-LLM parts first — Phase 1 (acquisition), Phase 2 (handlers + normalize/reconcile), and the deterministic tiers 3a (rule table) + 3b (historical exact match). The 3c RAG/LLM tier and its provider/embedding choices are decided later, once the deterministic path is proven.
+- **LLM provider: deferred.** We build the non-LLM parts first — Phase 1 (acquisition), Phase 2 (handlers + normalize/reconcile), the deterministic Phase 3 hard filter (rule table), and Phase 4's deterministic layer (the description/category maps + review inbox). Phase 4's **agent** step (LLM proposals for still-unmatched transactions) and its provider/embedding choices are decided later, once the deterministic path is proven.
 
 ---
 
@@ -33,10 +33,16 @@ lib/                   # importable libraries — no CLI, no data-root knowledge
   handlers/            # Phase 2 per-type handlers (registry keyed by account type)
   normalizer.py        # Phase 2 — Normalizer library (inject / output)
   reconcile.py         # Phase 2 — cross-account resolution / ledger check
-  categorize.py        # Phase 3 (3a/3b/3c)
+  rules.py             # Phase 3 hard-filter rule engine (shared with tools/rule_editor)
+  categorizer.py       # Phase 3 — hard-filter categorization over rules.py
+  resolver.py          # Phase 4 — resolve unmatched txns (maps → re-run rules / direct category)
+  resolve_lookup.py    # Phase 4 — persisted norm_key maps (description_map / category_map) + norm_key()
+  resolve_review.py    # Phase 4 — review_inbox schema + read/write (adds resolved_by + approved)
+  resolve_agent.py     # Phase 4 — LLM proposer for still-unmatched rows (deferred)
   sheets.py            # output to Google Sheet
 scripts/               # runnable orchestrators that drive the libraries
   normalize_batch.py   # scan a batch's raw/, resolve accounts, run Normalizer
+  resolve_batch.py     # Phase 4 orchestrator: resolve a batch's unmatched rows → review inbox
   pipeline.py          # orchestration entry point: python -m wallet_watch run
 tests/fixtures/        # synthetic/fake sample data only — never real exports
 ```
@@ -54,15 +60,18 @@ $WALLET_WATCH_DATA_DIR/
         amazon.csv                          # suffix optional
         splitwise.csv
       normalized_20260701_142530.csv   # step 2 output (staging), one per run — ledger-checked, user-approved
-      categorized.csv           # step 3 output (staging) — some rows flagged needs_review
+      categorized_20260701_143000.csv  # step 3 output (staging) — hard-filter hits (method 0) + unmatched rows
+      review_inbox_20260701_150000.csv # step 4 output (staging) — unmatched rows, each with resolved_by + approved (default 0)
   normalized/                    # committed store, grouped by year
     2026.csv
-  categorized/                   # committed store, grouped by year
+  categorized/                   # committed store, grouped by year (carries categorize_method)
     2026.csv
   rules/
-    keywords.yaml                # 3a human-maintained: merchant/keyword -> category (reveals real merchants → private)
-  lookup/                        # 3b auto-generated: norm_key -> category (rebuilt from categorized/ history)
-  index/                         # 3c embedding index + metadata
+    keywords.yaml                # Phase 3 human-maintained: merchant/keyword -> category (reveals real merchants → private)
+  lookup/                        # Phase 4 auto-generated maps (rebuilt/extended from approved history)
+    description_map.csv          #   norm_key(original) -> corrected_description  (path 1)
+    category_map.csv             #   norm_key(original) -> category               (path 2)
+  index/                         # Phase 4 agent embedding index + metadata (deferred)
   cache/llm/                     # LLM call cache (content hash)
 ```
 
@@ -72,7 +81,7 @@ The pipeline is **ad-hoc / batch-oriented**, not a daemon. Whenever the operator
 
 ### Data flow — one run
 
-A batch flows through four steps with **two human gates**. Each step is a separate command so the operator can stop, inspect, and resume.
+A batch flows through five steps with **two human gates**. Each step is a separate command so the operator can stop, inspect, and resume.
 
 ```
 1. ACQUIRE  user downloads/scrapes exports → batch/20260101-20260630/raw/<account-id>_<startYYYYMMDD>_<endYYYYMMDD>.csv
@@ -84,13 +93,16 @@ A batch flows through four steps with **two human gates**. Each step is a separa
 2. NORMALIZE → batch/.../normalized_<runtime>.csv   + ledger check report
                  |
                  ▸ GATE 1: user reviews ledger check → approve
-                 v  categorize (3a → 3b [→ 3c later])
-3. CATEGORIZE → batch/.../categorized.csv   (rows below confidence → flag needs_review)
+                 v  categorize (phase 3 = hard filter over rules.py)
+3. CATEGORIZE → batch/.../categorized_<runtime>.csv   (hard-filter hits → method 0; rest → unmatched)
                  |
-                 ▸ GATE 2: user resolves every needs_review row
+                 v  resolve (phase 4): unmatched rows → description/category maps + agent + manual
+4. PROCESS UNMATCHED → batch/.../review_inbox_<runtime>.csv   (every non-hard-matched row, approved=0)
+                 |
+                 ▸ GATE 2: user approves every review_inbox row (review_approver UI, batch approve) → approved=1
                  v  commit (append, date-conflict warning, route rows by transaction year)
-4. COMMIT   → append normalized.csv  → normalized/<year>.csv
-            → append categorized.csv → categorized/<year>.csv
+5. COMMIT   → append normalized  → normalized/<year>.csv
+            → append categorized → categorized/<year>.csv  (with categorize_method)
                  |
                  v
             Google Sheet
@@ -107,7 +119,9 @@ A batch flows through four steps with **two human gates**. Each step is a separa
 
 `lib/schema.py` defines two dataclasses:
 
-- `**Transaction`**: `date / amount / account / is_reference / original_description / corrected_description / category / tags`.
+- `**Transaction`**: `date / amount / account / is_reference / original_description / corrected_description / category / categorize_method / tags`.
+  - `corrected_description` is the **updated description** used by Phase 4 path 1: a clean rewrite of a cryptic `original_description` that the rule engine can then match. Empty when the original was good enough.
+  - `categorize_method` records where the category came from: **0** = Phase 3 hard filter, **1** = Phase 4 updated description (corrected_description re-matched by rules), **2** = Phase 4 manually entered / mapped category (a direct category decided once by hand, then auto-applied from `category_map`).
 - `**Account`**: `id / name / type / description` — one row per source account in the data repo's `accounts.csv`. `id` is unique and equals the raw filename prefix (`raw/<id>_<startYYYYMMDD>_<endYYYYMMDD>.csv`); `name` is written to `Transaction.account`; `type` selects the Phase 2 handler.
 
 Notes:
@@ -226,48 +240,90 @@ With every source now unified `Transaction` rows:
 
 ---
 
-## 5. Phase 3 — Categorize (→ `batch/<id>/categorized.csv`, GATE 2)
+## 5. Phase 3 — Categorize (hard filter → `batch/<id>/categorized_<runtime>.csv`)
 
-`categorize.py` reads the approved `batch/<id>/normalized.csv` and writes `batch/<id>/categorized.csv`. Each row is resolved on first hit in order, and rows that aren't confidently categorized get a `**needs_review`** flag (a column in the CSV) rather than being routed to a separate directory:
+`categorizer.py` reads the approved `batch/<id>/normalized_<runtime>.csv` and writes `batch/<id>/categorized_<runtime>.csv`. Phase 3 is the **hard filter only** — the deterministic, human-maintained rule table that categorizes the bulk of recurrent spending. It is the one tier whose results are trusted **without review**; every row it can't place is **unmatched** and handed to Phase 4.
 
-- **3a Rule table (human-maintained)**: `rules/keywords.yaml` merchant/keyword → category mapping, handling the bulk of recurrent spending.
-- **3b Historical exact match (auto-generated)**: `norm_key(merchant, comment)` (strip digits/punctuation, collapse whitespace) dict lookup; on hit, reuse the historical category **without an LLM call**. Rebuilt every run via `build_lookup` from the committed `categorized/<year>.csv` history.
-- **3c RAG + LLM (remaining fuzzy items — deferred, post-M4)**:
-  1. Build an embedding index over history (one-time, incrementally updated).
-  2. For the current transaction, retrieve the top-k most similar categorized records and assemble a few-shot prompt (including the full category definitions).
-  3. The LLM outputs `{category, confidence, reason}`; **≥ threshold → adopt, otherwise → flag `needs_review`**.
+- **Rule table (human-maintained)**: `rules/keywords.yaml` merchant/keyword → category mapping, evaluated **first-match-wins** by the shared `lib/rules.py` engine (the same engine `tools/rule_editor` edits). A hit stamps `category` and `categorize_method=0`.
+- **Unmatched rows**: any row no rule matches is written out with an empty `category` (and `categorize_method` left at its default `0`). An empty `category` **is** the unmatched signal — Phase 3 does **not** flag `needs_review` or call an LLM; it just leaves the row uncategorized for Phase 4.
 
-Rows not matched by 3a/3b (and, until 3c lands, everything fuzzy) are flagged `needs_review`.
-
-**GATE 2** — the operator resolves every `needs_review` row (edit category in the CSV). Only once no `needs_review` rows remain does commit run: append `normalized.csv`→`normalized/<year>.csv` and `categorized.csv`→`categorized/<year>.csv`, subject to the date-conflict warning. Resolved rows thereby become history that feeds 3b/3c on future batches.
+There is no GATE after Phase 3 on its own: hard-filter hits are final, and unmatched rows flow straight into Phase 4 ("Process Unmatched Transactions"), which owns GATE 2. A batch with zero unmatched rows can skip Phase 4 and commit directly.
 
 **Versioning**: the categorizer carries a version; output-schema changes must be backward compatible — support backfilling/re-running committed batches with a new version.
 
-The LLM (3c) uses the latest Claude model (Haiku is enough for a short classification task, Opus when needed); provider/embedding choices are deferred (see Decisions).
+---
+
+## 6. Phase 4 — Process Unmatched Transactions (→ `review_inbox_<runtime>.csv`, GATE 2)
+
+After Phase 3's hard filter, the categorized rows are done; what remains are the **unmatched** rows (empty `category`). Phase 4 categorizes these, but unlike Phase 3 **nothing it produces is trusted blindly**: every row it touches lands in a **review inbox** for the operator to approve. Driven by `scripts/resolve_batch.py` over `lib/resolver.py`; reads the newest `batch/<id>/categorized_<runtime>.csv`, resolves the unmatched rows, and writes `batch/<id>/review_inbox_<runtime>.csv`.
+
+*(Naming note: the whole phase shares the `resolve*` prefix — `resolver.py`, `resolve_lookup.py`, `resolve_review.py`, `resolve_agent.py`, `scripts/resolve_batch.py` — so it reads as one family, deliberately distinct from Phase 2's cross-account ledger `lib/reconcile.py`. "Reconcile" is reserved for the ledger.)*
+
+### 6.1 Two paths
+
+An unmatched row can be salvaged two ways, and which one applies decides its `categorize_method`:
+
+- **Path 1 — updated description (`categorize_method=1`).** The `original_description` is too cryptic for any rule (`SQ *7F3K9`, `TST* MERCHANT 8842`). A clean merchant name goes into `corrected_description`, and the resolver **re-runs the Phase 3 rule engine on that corrected text**. If a rule now hits, the row is categorized. This is the **preferred** path: one description fix lets an existing (or newly added) `keywords.yaml` rule generalize to every sibling merchant, so the fix compounds. (Rules are authored against `original_description`, so the re-match substitutes the corrected text into that column for matching only — the stored row keeps its true `original_description`.)
+- **Path 2 — direct category (`categorize_method=2`).** There's no meaningful merchant to recover (a raw Zelle memo, a genuine one-off). A category is assigned outright, no rule involved.
+
+### 6.2 First run vs. future runs — `lib/resolve_lookup.py` (`class Lookup`)
+
+The two decisions are remembered in persisted maps keyed by the **normalized original description** — `norm_key` (casefold, strip punctuation, strip digit runs, collapse whitespace), so every store-number/order-id variant of one merchant shares a key:
+
+- `lookup/description_map.csv` — `norm_key(original) → corrected_description` (path 1)
+- `lookup/category_map.csv` — `norm_key(original) → category` (path 2)
+
+- **First run** over a new merchant is **manual**: the operator supplies the updated description (path 1) or the category (path 2), and approving it (§6.3) writes the decision back into the map — so the manual work is done **once per distinct merchant**.
+- **Future runs** are **match + agent** (`lib/resolver.py`, `class Resolver`):
+  1. **Match** — look `norm_key(original)` up in both maps. A description-map hit sets `corrected_description` and re-runs rules (method 1); a category-map hit assigns the category (method 2). Description-map wins if both hit; if a path-1 re-match still finds no rule, the fix is kept and the row falls through to the category map, then to manual.
+  2. **Agent (`lib/resolve_agent.py`, LLM — deferred, provider decided in Decisions)** — for rows still unmatched, an agent *proposes* an updated description or a category to cut manual typing. Proposals are **never auto-adopted** — they enter the inbox as suggestions (`resolved_by=agent`) the operator confirms or overrides.
+  3. **Still nothing** — the row enters the inbox `resolved_by=none` for the operator to fill in.
+
+### 6.3 Review inbox & approval — `lib/resolve_review.py` + `tools/review_approver/`
+
+`resolve_batch.py` writes **every** unmatched row to `review_inbox_<runtime>.csv` = the `Transaction` columns plus two workflow columns: **`resolved_by`** (`desc-map` / `cat-map` / `agent` / `none`, so the operator can triage and batch-approve by source) and **`approved`** (defaults to **0**).
+
+- **GATE 2 is "empty the inbox"**: the operator reviews every `approved=0` row — accept the suggested category / edit the `corrected_description` / fix the category — and flips it to `1`. **All non-hard-matched rows require approval**, including exact map hits (the map only pre-fills the suggestion; it never auto-approves). A dedicated **`review_approver`** UI (built separately, DearPyGui, mirrors `tools/rule_editor`) makes this fast with **batch approve** (multi-select → approve); a plain CSV edit is the fallback.
+- Approving a row **feeds its decision back into the maps** (§6.2), and a path-1 fix may prompt a new `keywords.yaml` rule, so the same merchant auto-resolves next time.
+- Commit runs only once **no `approved=0` rows remain** (`resolve_review.all_approved`). Approved rows merge back into the batch's categorized output (carrying `category`, `corrected_description`, `categorize_method`) and commit exactly as Phase 3 rows do, subject to the same date-conflict guard.
+
+### 6.4 `categorize_method` summary
+
+| value | meaning | set by |
+| --- | --- | --- |
+| 0 | hard filter | Phase 3 rule engine (`categorizer.py`) |
+| 1 | updated description | Phase 4 path 1 — `corrected_description` re-matched by rules |
+| 2 | manually entered / mapped category | Phase 4 path 2 — direct category |
 
 ---
 
-## 6. Milestones & Execution Order
+## 7. Milestones & Execution Order
 
 Wire up one **vertical slice** first (single source → full chain → output to sheet), then expand horizontally across sources and vertically into RAG.
 
 - **M0 — Scaffolding + data root**: set up the Python package structure, the `.gitignore`/`CLAUDE.md` data guards, data-root resolution (`--data-dir` / `WALLET_WATCH_DATA_DIR`), the batch layout convention, and `accounts.csv`. Manually export real sample CSVs into a batch under the external data root (not the repo) — that's Phase 1 for chase; commit only **synthetic** fixtures under `tests/fixtures/`.
-- **M1 — Vertical slice (chase)**: the full four-step batch flow for one source — `acquire (manual export) → normalize: chase handler + cross-account (+GATE 1) → categorize 3a+3b (+GATE 2) → commit to <year>.csv`. Verify idempotent in-batch re-runs and the commit date-conflict warning.
-- **M2 — Max out deterministic categorization**: flesh out `rules/keywords.yaml` and 3b exact matching so ~80% of recurrent spending is auto-categorized (no `needs_review`).
+- **M1 — Vertical slice (chase)**: the full batch flow for one source — `acquire (manual export) → normalize: chase handler + cross-account (+GATE 1) → categorize (Phase 3 hard filter) → commit to <year>.csv`. Verify idempotent in-batch re-runs and the commit date-conflict warning.
+- **M2 — Max out deterministic categorization**: flesh out `rules/keywords.yaml` so ~80% of recurrent spending is auto-categorized by the Phase 3 hard filter (few unmatched rows).
 - **M3 — Expand sources**: for each new source, solve Phase 1 acquisition (email reading, order export, screenshot+agent) **and** register its Phase 2 handler `type` — Apple, e-commerce order history, Splitwise/Venmo.
 - **M4 — Ledger check & friend transfers**: e-commerce aggregation + ledger-reference check in the GATE 1 report; friend-transfer flagging + approve flow.
-- **M5 — 3c RAG (LLM, deferred)**: embedding index + few-shot LLM + confidence routing feeding `needs_review`. Provider decided here.
-- **M6 — Google Sheet output**: `sheets.py` injects the committed year files' structured data, integrating with the existing chart system.
+- **M5 — Phase 4 deterministic resolve** *(implemented)*: `schema.categorize_method`; `lib/resolve_lookup.py` (`norm_key` + `Lookup` maps); `lib/resolver.py` (unmatched → description-map re-match / category-map); `lib/resolve_review.py` (`review_inbox` with `resolved_by` + `approved`); `scripts/resolve_batch.py`. Every unmatched row goes to the inbox at `approved=0`; commit gated on an empty inbox. Approval via CSV edit until the UI lands.
+- **M6 — Review approver UI**: `tools/review_approver/` (DearPyGui, mirrors `tools/rule_editor`) with **batch approve** and writeback into the `lookup/` maps (and prompting new `keywords.yaml` rules).
+- **M7 — Phase 4 agent (LLM, deferred)**: `lib/resolve_agent.py` proposes updated descriptions / categories for still-unmatched rows (optionally RAG few-shot over history). Provider + embedding choices decided here.
+- **M8 — Google Sheet output**: `sheets.py` injects the committed year files' structured data, integrating with the existing chart system.
 
 ---
 
-## 7. Open Questions (TBD)
+## 8. Open Questions (TBD)
 
 1. **E-commerce export method**: do Taobao/Xiaohongshu/Amazon offer one-click order export? If not, nail down a stable screenshot + agent flow.
 2. **Splitwise / Venmo export format**: confirm the export fields — can they cover "who paid, memo, split"?
 3. **Embedding provider**: local `sentence-transformers` (private, offline, plenty for this small volume, **recommended**) vs cloud (Voyage/OpenAI).
-4. **Schema fields to add**: whether to add `categorizer_version` to `Transaction`. (No dedup `id` — commit uses the date-conflict guard instead of a content key.)
+4. **Schema fields to add**: whether to add `categorizer_version` to `Transaction`. (`categorize_method` is now a field; no dedup `id` — commit uses the date-conflict guard instead of a content key.)
 5. **Date-conflict granularity**: warn if *any* transaction date in the batch already exists in the year file (simple, may over-warn on boundary overlaps), vs a tighter heuristic. Start with the simple per-date warning.
-6. **Review ergonomics**: `needs_review` rows are resolved by editing `batch/<id>/categorized.csv` directly — is a plain CSV edit good enough, or do we want a thin helper (e.g. a filtered view / local UI) once volume grows?
-7. **Google Sheet injection**: Sheets API with a service account vs manually pasting exported CSV.
+6. **Approval writeback**: how does the `review_approver` (M6) write approved rows back? Merge the resolved `category`/`corrected_description`/`categorize_method` into the batch's `categorized_<runtime>.csv` **in place**, or emit a new `categorized_resolved_<runtime>.csv` that commit reads? And since a transaction has no dedup id, how are inbox rows matched back to their categorized rows — by row position, or by a batch-local index column?
+7. **Does `approved` reach the year store?**: keep `approved` (and `resolved_by`) as batch-only workflow columns (everything committed is by definition approved), or persist them into `categorized/<year>.csv` for audit?
+8. **Seeding the maps**: `description_map`/`category_map` start empty and fill from approved history — is a first-run bulk-import (or agent-seeded pass) worth it, or is per-merchant manual entry fine at this volume?
+9. **Google Sheet injection**: Sheets API with a service account vs manually pasting exported CSV.
+
+*Resolved this round: "auto-approve exact map matches?" — no. Every non-hard-matched row is manually approved; the `review_approver` UI makes it fast with batch approve.*
 

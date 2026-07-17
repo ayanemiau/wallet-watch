@@ -11,10 +11,10 @@ the *same* row shape (`schema.to_row`, whose keys are the CSV column contract).
 So a rule that categorizes a transaction one way in the editor categorizes it the
 same way here.
 
-Scope: tier 3a (the human-maintained rule table) only. Tier 3b (historical exact
-match) and 3c (RAG/LLM) — and the `needs_review` flag for rows nothing matches —
-are separate later phases (plan.md §5); here an unmatched row simply keeps its
-existing (empty) category.
+Scope: the Phase 3 hard filter (the human-maintained rule table) only. A row no
+rule matches keeps its existing (empty) category and is left for Phase 4
+("Process Unmatched Transactions", plan.md §6) to resolve and route through
+review — this library never flags or guesses.
 
 The orchestrator that reads/writes batch files lives in `scripts/categorize.py`;
 this library knows nothing about the data root or batch layout.
@@ -30,7 +30,6 @@ from schema import Transaction, to_row
 # The categorizer carries a version (plan.md §5): output-schema changes must stay
 # backward compatible so committed batches can be re-run with a newer version.
 # Bumped only when the categorization output changes in a way history must track.
-# (Not yet stamped onto Transaction — that is plan.md open question #4.)
 CATEGORIZER_VERSION = 1
 
 
@@ -53,5 +52,8 @@ class Categorizer:
             # to_row yields the exact Dict[str, str] shape the engine (and the
             # editor's preview) matches against — same columns, same encoding.
             category = categorize_row(rules, to_row(txn))
-            result.append(txn if category is None else replace(txn, category=category))
+            # a hit is the hard filter: stamp categorize_method=0 (plan.md §6.4).
+            # a miss leaves the row untouched (empty category) — Phase 4's input.
+            result.append(txn if category is None
+                          else replace(txn, category=category, categorize_method=0))
         return result

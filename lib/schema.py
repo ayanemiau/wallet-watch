@@ -44,6 +44,14 @@ class Transaction:
     # the category of the transaction
     category: str = ""
 
+    # how the category was assigned (plan.md §6.4):
+    #   0 = Phase 3 hard filter (rule table)
+    #   1 = Phase 4 updated description (corrected_description re-matched by rules)
+    #   2 = Phase 4 manually entered / mapped category
+    # Defaults to 0: a fresh normalized row (no category yet) carries 0, and so
+    # does a Phase 3 hard-filter hit.
+    categorize_method: int = 0
+
     # tags of the transaction
     tags: List[str] = field(default_factory=list)
 
@@ -113,6 +121,20 @@ def decode_bool(raw: str) -> bool:
     raise ValueError(f"expected 1 or 0, got {raw!r}")
 
 
+def encode_method(value: int) -> str:
+    return str(value)
+
+
+def decode_method(raw: str) -> int:
+    # an older CSV without the column reads as 0 (the default / hard-filter code)
+    if raw == "":
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"expected an integer categorize_method, got {raw!r}")
+
+
 def to_row(txn: Transaction) -> Dict[str, str]:
     return {
         "date": txn.date,
@@ -122,6 +144,7 @@ def to_row(txn: Transaction) -> Dict[str, str]:
         "original_description": txn.original_description,
         "corrected_description": txn.corrected_description,
         "category": txn.category,
+        "categorize_method": encode_method(txn.categorize_method),
         "tags": encode_tags(txn.tags),
     }
 
@@ -137,5 +160,6 @@ def from_row(row: Dict[str, str]) -> Transaction:
         original_description=row.get("original_description", ""),
         corrected_description=row.get("corrected_description", ""),
         category=row.get("category", ""),
+        categorize_method=decode_method(row.get("categorize_method", "")),
         tags=decode_tags(row.get("tags", "")),
     )
