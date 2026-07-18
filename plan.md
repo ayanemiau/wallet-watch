@@ -43,6 +43,7 @@ lib/                   # importable libraries — no CLI, no data-root knowledge
 scripts/               # runnable orchestrators that drive the libraries
   normalize_batch.py   # scan a batch's raw/, resolve accounts, run Normalizer
   resolve_batch.py     # Phase 4 orchestrator: resolve a batch → review_<runtime>.csv (all rows)
+  commit_batch.py      # Phase 4 orchestrator: append an approved batch → categorized/<year>.csv
   pipeline.py          # orchestration entry point: python -m wallet_watch run
 tools/                 # standalone DearPyGui apps over the libraries (not the pipeline)
   rule_editor/         # edit rules/keywords.yaml (Phase 3), preview match counts
@@ -65,9 +66,9 @@ $WALLET_WATCH_DATA_DIR/
       normalized_20260701_142530.csv   # step 2 output (staging), one per run — ledger-checked, user-approved
       categorized_20260701_143000.csv  # step 3 output (staging) — hard-filter hits (source filter-rules) + unmatched rows
       review_20260701_150000.csv       # step 4 output (staging) — ALL rows + resolved_by + approved (hard rows pre-approved; rest default 0)
-  normalized/                    # committed store, grouped by year
-    2026.csv
-  categorized/                   # committed store, grouped by year (carries category_source)
+      .committed                       # written by commit_batch: this batch is in the year store (read_history skips it)
+  normalized/                    # committed ledger store, by year (DEFERRED — categorized/ is its superset)
+  categorized/                   # committed store, grouped by year (carries category_source) — the source of truth
     2026.csv
   rules/
     keywords.yaml                # Phase 3 human-maintained: merchant/keyword -> category (reveals real merchants → private)
@@ -103,18 +104,18 @@ A batch flows through five steps with **two human gates**. Each step is a separa
 4. PROCESS UNMATCHED → batch/.../review_<runtime>.csv   (ALL rows; hard pre-approved, rest approved=0)
                  |
                  ▸ GATE 2: user approves every non-hard row + corrects category / sets one-off override (review_approver UI) → approved=1
-                 v  commit (append, date-conflict warning, route rows by transaction year)
-5. COMMIT   → append normalized  → normalized/<year>.csv
-            → append categorized → categorized/<year>.csv  (with category_source)
+                 v  commit_batch (gate: all approved; route by year; date-conflict guard → --force)
+5. COMMIT   → append categorized → categorized/<year>.csv  (with category_source)
+            → mark batch/.committed  (blocks re-commit; read_history then skips it)
                  |
                  v
             Google Sheet
 ```
 
-- **Batch dir is transient scratch**; the committed source of truth is the year-grouped `normalized/<year>.csv` and `categorized/<year>.csv`. Grouping is **by year only**.
-- **Commit is a plain append — no automatic dedup.** There is no idempotent id we can derive from a transaction: two entries with the same date, description, amount, and memo can be genuinely distinct purchases, so silently deduping would drop real data. Rows are routed to the file matching each transaction's own year, so a batch spanning a year boundary splits into two files.
-- **Date-conflict guard**: before appending, commit checks whether the target year file already contains rows for any date present in the batch. If so, it **warns (listing the conflicting dates) and asks the operator to confirm** before proceeding. This is the safety net against accidentally committing the same batch twice, without ever auto-dropping legitimate duplicates.
-- Once committed, a batch dir can be archived or deleted; the year files fully reconstruct history.
+- **Batch dir is transient scratch**; the committed source of truth is the year-grouped `categorized/<year>.csv`. Grouping is **by year only**. (`normalized/<year>.csv` — a categories-free ledger — is deferred; `categorized/` is its superset.)
+- **Commit is a plain append — no automatic dedup.** There is no idempotent id we can derive from a transaction: two entries with the same date, description, amount, and memo can be genuinely distinct purchases, so silently deduping would drop real data. Rows are routed to the file matching each transaction's own year, so a batch spanning a year boundary splits into two files. Only `Transaction` columns are written, so the review-only `resolved_by`/`approved` are dropped.
+- **Two gates before an append**: `commit_batch` refuses unless **every** review row is approved (GATE 2), then a **date-conflict guard** checks whether the target year file already holds rows for a date in the batch — if so it **prints the conflicting dates and refuses (exit non-zero) unless `--force`**. This is the safety net against committing the same batch twice, without ever auto-dropping legitimate duplicates.
+- On success it writes a **`batch/.committed`** marker: this blocks a re-commit (unless `--force`) and tells `read_history` to stop reading the batch's review file (its rows are in the year store now — no double-count). A committed batch dir can then be archived or deleted; the year files fully reconstruct history.
 
 ---
 
@@ -289,7 +290,7 @@ The `review_<runtime>.csv` is the `Transaction` columns plus two workflow column
 - `**review_approver`** (DearPyGui, mirrors `tools/rule_editor`) opens the file in **two tabs** split by `resolved_by`: **Review inbox** (everything not `hard` — the queue to clear) and **Everything else** (the trusted hard rows, still overridable). Per-row select checkboxes with **Select all / Unselect all** and **Approve / Unapprove selected** handle single or bulk approval; a plain CSV edit is the fallback.
 - The reviewer edits three derived columns: `corrected_description` ("updated description"), `**category`** (correct the learned value — stamps `category_source=human-review`), and `**category_override**` (a one-off that wins but is never learned). Every **raw** field is read-only, so a correction — even of a hard-filter row — never touches raw data. **Save** writes the file back in place.
 - **GATE 2 is "empty the inbox"**: commit runs only once **no `approved=0` rows remain** (`resolve_review.all_approved`). Because the review file already holds every row (edited in place), commit reads it directly — `effective_category = category_override or category` — subject to the same date-conflict guard.
-- **How corrections are learned (no writeback):** the `lookup/` maps are a *projection of history*, so a corrected `category` is learned simply by being read back by `build_lookup` next run (`read_history` reads the committed `categorized/<year>.csv` **and** approved `review_*.csv` rows). Most-recent wins, so re-approving a merchant re-labels it. `category_override` is excluded from the projection. *(`build_lookup` is implemented; the commit step that moves approvals into `categorized/<year>.csv` is not — until then approved review files are read directly; see §8.)*
+- **How corrections are learned (no writeback):** the `lookup/` maps are a *projection of history*, so a corrected `category` is learned simply by being read back by `build_lookup` next run. `read_history` reads the committed `categorized/<year>.csv` **and** the approved `review_*.csv` rows of **un-committed** batches (a `.committed` batch is skipped — its rows are already in the year store). Most-recent wins, so re-approving a merchant re-labels it. `category_override` is excluded from the projection.
 
 ### 4d `category_source` summary
 
@@ -321,7 +322,8 @@ Wire up one **vertical slice** first (single source → full chain → output to
 - **M4 — Ledger check & friend transfers**: e-commerce aggregation + ledger-reference check in the GATE 1 report; friend-transfer flagging + approve flow.
 - **M5 — Phase 4 deterministic resolve** *(implemented)*: `schema.category_source`; `lib/resolve_lookup.py` (`norm_key` + `Lookup` maps); `lib/resolver.py` (`resolve_all`: hard rows pre-approved, unmatched → description-map re-match / category-map); `lib/resolve_review.py` (`review_<runtime>.csv` with `resolved_by` + `approved`); `scripts/resolve_batch.py` (all rows). Commit gated on `all_approved`.
 - **M6 — Review approver UI** *(implemented)*: `schema.category_override` + `effective_category` + `CategorySource` enum (incl. `human-review`); `tools/review_approver/` (DearPyGui, mirrors `tools/rule_editor`) — two tabs (Review inbox / Everything else), select + **batch approve**, edit `corrected_description` / `category` (learned) / `category_override` (one-off), save in place.
-- **M6.5 — Learned dict (`build_lookup`)** *(implemented)*: `lib/resolve_lookup.py` gains `build_lookup` + `CategoryLookup` (amount-aware), and `scripts/resolve_batch.py` `read_history` (committed store + approved review rows) — the maps are now reprojected from history each run (most-recent wins), not static files. *Follow-up (not yet built): the commit step that moves approvals into `categorized/<year>.csv`; see §8.*
+- **M6.5 — Learned dict (`build_lookup`)** *(implemented)*: `lib/resolve_lookup.py` gains `build_lookup` + `CategoryLookup` (amount-aware), and `scripts/resolve_batch.py` `read_history` (committed store + approved review rows) — the maps are now reprojected from history each run (most-recent wins), not static files.
+- **M7 — Commit step** *(implemented)*: `scripts/commit_batch.py` appends an approved batch's reviewed rows to `categorized/<year>.csv` (routed by year), gated on `all_approved`, with a date-conflict guard (`--force`) and a `batch/.committed` marker that blocks re-commit and makes `read_history` skip the batch. Closes the learning loop: approve → commit → year store → `build_lookup`.
 - **M7 — Phase 4 agent (LLM, deferred)**: `lib/resolve_agent.py` proposes updated descriptions / categories for still-unmatched rows (optionally RAG few-shot over history). Provider + embedding choices decided here.
 - **M8 — Google Sheet output**: `sheets.py` injects the committed year files' structured data, integrating with the existing chart system.
 
@@ -334,7 +336,7 @@ Wire up one **vertical slice** first (single source → full chain → output to
 3. **Embedding provider**: local `sentence-transformers` (private, offline, plenty for this small volume, **recommended**) vs cloud (Voyage/OpenAI).
 4. **Schema fields to add**: whether to add `categorizer_version` to `Transaction`. (`category_source` is now a typed field; no dedup `id` — commit uses the date-conflict guard instead of a content key.)
 5. **Date-conflict granularity**: warn if *any* transaction date in the batch already exists in the year file (simple, may over-warn on boundary overlaps), vs a tighter heuristic. Start with the simple per-date warning.
-6. **The commit step** *(the one piece left of the learning loop)*: `build_lookup` is **implemented** — it projects both maps from history (`read_history` = committed `categorized/<year>.csv` + approved `review_*.csv`, most-recent wins; category map is amount-aware). What's still unbuilt is the **commit step** that appends approved review rows into `categorized/<year>.csv` (with the date-conflict guard). Until it lands, `read_history` reads approved review files directly, so the loop already works — the commit step just makes the year store the durable home and lets batch dirs be archived.
+6. **Learning loop** *(done)*: `build_lookup` + the commit step are both implemented, so the loop is closed — approve → `commit_batch` → `categorized/<year>.csv` → `build_lookup` projects the maps next run. Remaining polish: whether `commit_batch` should auto-archive/delete a committed batch dir (today the `.committed` marker leaves it in place), and whether to also emit a categories-free `normalized/<year>.csv`.
 7. **Does `approved` reach the year store?**: keep `approved` (and `resolved_by`) as batch-only workflow columns (everything committed is by definition approved), or persist them into `categorized/<year>.csv` for audit?
 8. **Seeding the maps**: `description_map`/`category_map` start empty and fill from approved history — is a first-run bulk-import (or agent-seeded pass) worth it, or is per-merchant manual entry fine at this volume?
 9. **Google Sheet injection**: Sheets API with a service account vs manually pasting exported CSV.

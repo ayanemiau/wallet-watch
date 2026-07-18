@@ -124,6 +124,8 @@ def read_history(data_dir: Path) -> List[Transaction]:
         for batch in batch_root.iterdir():
             if not (batch.is_dir() and BATCH_ID_RE.fullmatch(batch.name)):
                 continue
+            if (batch / ".committed").exists():
+                continue                                      # its rows are in the year store now
             reviews = sorted(batch.glob("review_*.csv"))
             if reviews:
                 latest_per_batch.append(reviews[-1])          # newest run in that batch

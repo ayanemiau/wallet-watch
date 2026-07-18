@@ -220,3 +220,24 @@ def test_read_history_empty_when_nothing_committed(tmp_path):
     (data / "batch").mkdir(parents=True)
     from resolve_batch import read_history
     assert read_history(data) == []
+
+
+def test_read_history_skips_committed_batches(tmp_path):
+    # once a batch has a .committed marker its rows are in the year store, so its
+    # review file must NOT be read again (no double-count); uncommitted ones still are.
+    from resolve_batch import read_history
+
+    data = tmp_path / "data"
+    committed = data / "batch" / "20260201-20260228"
+    committed.mkdir(parents=True)
+    write_review(committed / "review_20260301_000000.csv",
+                 [ReviewRow(txn("SHOP X", category="Groceries"), BY_NONE, approved=True)])
+    (committed / ".committed").write_text("committed\n")
+
+    live = data / "batch" / "20260301-20260331"
+    live.mkdir(parents=True)
+    write_review(live / "review_20260401_000000.csv",
+                 [ReviewRow(txn("SHOP Y", category="Dining"), BY_NONE, approved=True)])
+
+    history = read_history(data)
+    assert [t.original_description for t in history] == ["SHOP Y"]
