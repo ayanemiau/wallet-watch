@@ -20,6 +20,11 @@ Input resolution, in order: `--input <review.csv>` wins; else `--batch-dir`'s ne
 `<data-root>/batch/` (`--data-dir`, then `$WALLET_WATCH_DATA_DIR`). The file is read
 and validated **before** the window opens, so a bad path is a plain CLI error.
 
+**Light / dark theme.** `--theme auto|light|dark` (default `auto`) picks the palette at
+launch — `auto` follows the macOS appearance setting. A `☾ Dark` / `☀ Light` button in the
+toolbar toggles it live thereafter. The palette and the detection live in
+`tools/tool_theme.py`, shared with `tools/rule_editor`.
+
 ## It's real data
 
 A `review_*.csv` is real transaction data — it lives in the external data root, never

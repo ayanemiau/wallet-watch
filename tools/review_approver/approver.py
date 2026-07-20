@@ -34,9 +34,13 @@ from typing import Dict, List, Optional, Set, Tuple
 # scripts/resolve_batch.py import them so they read/write identically. Put lib/
 # on the path before importing (review_model imports them too).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "lib"))
+# tools/ holds tool_theme (the palette + macOS light/dark detection shared with
+# tools/rule_editor).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import dearpygui.dearpygui as dpg  # noqa: E402
 
+import tool_theme  # noqa: E402
 from review_model import (candidates, counts, is_dirty, match_candidates,  # noqa: E402
                           split_tabs)
 from resolve_review import ReviewRow, read_review, write_review  # noqa: E402
@@ -46,28 +50,20 @@ from schema import CategorySource  # noqa: E402
 BATCH_ID_RE = re.compile(r"\d{8}-\d{8}")
 
 
-def _rgb(value: str) -> List[int]:
-    value = value.lstrip("#")
-    return [int(value[i:i + 2], 16) for i in (0, 2, 4)]
-
-
-# Claude-ish warm palette (shared with tools/rule_editor).
-BG = _rgb("#FAF9F5")
-SURFACE = _rgb("#FFFFFF")
-TEXT = _rgb("#3D3929")
-MUTED = _rgb("#83827D")
-ACCENT = _rgb("#D97757")
-ACCENT_ACTIVE = _rgb("#C4623F")
-BORDER = _rgb("#E5E4DF")
-OK = _rgb("#617A5C")
-WHITE = [255, 255, 255]
-TABLE_HEADER = _rgb("#EAE8E1")
+# The Claude-ish warm palette lives in tool_theme (shared with rule_editor).
+# Load the light values into module scope as the bare names the theme builders
+# and inline `color=` args reference (BG, SURFACE, TEXT, MUTED, ACCENT,
+# ACCENT_ACTIVE, BORDER, OK, WHITE, TABLE_HEADER). main() re-applies the resolved
+# palette before building, and apply_theme() swaps it live on toggle.
+globals().update(tool_theme.LIGHT)
 
 MAIN = "main_window"
 TABLE = "review_table"
 HEADER_TXT = "header_text"
 DIRTY_TXT = "dirty_text"
+LEGEND_TXT = "legend_text"
 SAVE_BTN = "save_button"
+THEME_BTN = "theme_button"
 TAB_INBOX_BTN = "tab_inbox_button"
 TAB_REST_BTN = "tab_rest_button"
 ALERT = "alert_modal"
@@ -103,6 +99,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--input", type=Path, default=None,
                    help="review CSV to approve; defaults to the newest "
                         "review_*.csv in the batch")
+    p.add_argument("--theme", choices=["auto", "light", "dark"], default="auto",
+                   help="auto follows the macOS setting; the in-app button toggles after launch")
     return p.parse_args()
 
 
@@ -154,7 +152,7 @@ def resolve_input(args: argparse.Namespace, data_dir: Optional[Path]) -> Path:
 # --- theme / font (shared look with tools/rule_editor) ---
 
 
-def init_theme() -> None:
+def init_theme() -> int:
     with dpg.theme() as theme:
         with dpg.theme_component(dpg.mvAll):
             dpg.add_theme_color(dpg.mvThemeCol_WindowBg, BG)
@@ -183,6 +181,7 @@ def init_theme() -> None:
             dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 8, 6)
             dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 16, 12)
     dpg.bind_theme(theme)
+    return theme
 
 
 def accent_theme() -> str:
@@ -266,6 +265,10 @@ class ReviewApprover:
         self.status_items: Dict[int, int] = {}            # master idx -> ✓/— text id (active tab)
         self.accent = accent_theme()
         self.tab_active, self.tab_inactive = tab_themes()
+        # theming: main() sets theme_name (resolved "light"/"dark") and
+        # global_theme (the bound theme id) so apply_theme can rebuild on toggle.
+        self.theme_name = "light"
+        self.global_theme: Optional[int] = None
         # category autocomplete session (None when the dropdown is closed)
         self.ac_input: Optional[int] = None               # focused input widget id
         self.ac_target: Optional[Tuple[int, str]] = None  # (master idx, field name)
@@ -306,10 +309,12 @@ class ReviewApprover:
                                callback=lambda: self._set_selected_approved(True))
                 dpg.add_button(label="Unapprove selected",
                                callback=lambda: self._set_selected_approved(False))
-                save = dpg.add_button(label="Save", tag=SAVE_BTN, width=110,
-                                      callback=self.save)
-                dpg.bind_item_theme(save, self.accent)
-            dpg.add_text(COLUMN_LEGEND, color=MUTED)
+                dpg.add_button(label="Save", tag=SAVE_BTN, width=110,
+                               callback=self.save)
+                dpg.bind_item_theme(SAVE_BTN, self.accent)
+                dpg.add_button(label=self._theme_label(), tag=THEME_BTN, width=90,
+                               callback=self.toggle_theme)
+            dpg.add_text(COLUMN_LEGEND, tag=LEGEND_TXT, color=MUTED)
             dpg.add_spacer(height=6)
             dpg.add_group(tag=TABLE)                       # table container, rebuilt per tab
         dpg.set_primary_window(MAIN, True)
@@ -322,6 +327,40 @@ class ReviewApprover:
             pass
         self._render_tab()
         self.refresh()
+
+    # --- theming --------------------------------------------------------
+
+    def _theme_label(self) -> str:
+        # the button shows what you'll switch TO
+        return "Light" if self.theme_name == "dark" else "Dark"
+
+    def toggle_theme(self, *_) -> None:
+        self.apply_theme("light" if self.theme_name == "dark" else "dark")
+
+    def apply_theme(self, name: str) -> None:
+        """Swap the whole UI to the light/dark palette live.
+
+        DPG doesn't cascade a palette change to existing widgets, so we reassign
+        the module colour constants, rebuild + rebind every theme item, update
+        the viewport background, and poke the persistent inline-coloured texts.
+        _render_tab() rebuilds the active tab's table (and re-binds the tab
+        buttons via _bind_tabs), so the row colours follow.
+        """
+        self.theme_name = name
+        globals().update(tool_theme.palette(name))
+        if self.global_theme is not None:
+            dpg.delete_item(self.global_theme)
+        self.global_theme = init_theme()
+        dpg.set_viewport_clear_color(BG + [255])
+        for t in (self.accent, self.tab_active, self.tab_inactive):
+            dpg.delete_item(t)
+        self.accent = accent_theme()
+        self.tab_active, self.tab_inactive = tab_themes()
+        dpg.bind_item_theme(SAVE_BTN, self.accent)
+        dpg.configure_item(DIRTY_TXT, color=MUTED)
+        dpg.configure_item(LEGEND_TXT, color=MUTED)
+        dpg.configure_item(THEME_BTN, label=self._theme_label())
+        self._render_tab()
 
     def _bind_tabs(self) -> None:
         dpg.bind_item_theme(TAB_INBOX_BTN,
@@ -534,7 +573,7 @@ class ReviewApprover:
                       f"({c.pending} awaiting approval, {c.uncategorized} uncategorized)"
                       f"  ·  {c.hard} hard-filter")
         dirty = self.is_dirty()
-        dpg.set_value(DIRTY_TXT, "● unsaved" if dirty else "")
+        dpg.set_value(DIRTY_TXT, "* unsaved" if dirty else "")
         dpg.configure_item(SAVE_BTN, enabled=dirty)
 
     def is_dirty(self) -> bool:
@@ -605,9 +644,14 @@ def main() -> None:
           file=sys.stderr)
 
     dpg.create_context()
-    init_theme()
+    # Resolve + apply the palette BEFORE any theme or widget is built.
+    theme_name = tool_theme.resolve_theme(args.theme)
+    globals().update(tool_theme.palette(theme_name))
+    theme_id = init_theme()
     init_font()
     approver = ReviewApprover(input_path, rows)
+    approver.theme_name = theme_name
+    approver.global_theme = theme_id
     approver.build()
     dpg.create_viewport(title="wallet-watch — review approver",
                         width=1500, height=820, clear_color=BG + [255])

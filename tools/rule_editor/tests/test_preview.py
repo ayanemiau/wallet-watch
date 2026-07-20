@@ -7,8 +7,13 @@ TOOL = Path(__file__).resolve().parent.parent
 
 sys.path.insert(0, str(TOOL))
 
+from decimal import Decimal  # noqa: E402
+
 from preview import (  # noqa: E402
-    build_entries, changed, group_by_category, uncategorized,
+    AMOUNT_ALL, AMOUNT_CUSTOM, AMOUNT_GT500, AMOUNT_LT100, AMOUNT_MID,
+    PreviewEntry, account_counts, amount_counts, amount_ok, build_entries,
+    cell_amount, changed, distinct_accounts, group_by_category, match_categories,
+    rule_categories, sort_value, uncategorized, view_entries,
 )
 from rules import Condition, Rule  # noqa: E402
 
@@ -170,3 +175,141 @@ def test_two_rules_sharing_a_category_land_in_one_group():
     live = [rule("Coffee", "FAKE COFFEE"), rule("Coffee", "SAMPLE ROASTERS")]
     groups = group_by_category(build_entries([], live, ROWS))
     assert [(name, len(rows)) for name, rows in groups] == [("Coffee", 2)]
+
+
+# --- panel filter / sort (view_entries + helpers) ---
+
+
+def entry(amount="-5.00", account="Fake Card", desc="X", old=None, new=None, ri=None):
+    return PreviewEntry(row={"date": "2026-01-07", "amount": amount, "account": account,
+                             "original_description": desc},
+                        old=old, new=new, rule_index=ri)
+
+
+def test_distinct_accounts_sorted_unique_incl_blank():
+    rows = [{"account": "chase"}, {"account": "apple"}, {"account": "chase"}, {"account": ""}]
+    assert distinct_accounts(rows) == ["", "apple", "chase"]
+
+
+def test_cell_amount_parses_or_none():
+    assert cell_amount(entry("-12.34")) == Decimal("-12.34")
+    assert cell_amount(entry("")) is None          # blank drops out
+    assert cell_amount(entry("pending")) is None   # non-numeric never raises
+
+
+def test_amount_ok_uses_magnitude():
+    # spend is negative; the operator means the size of the transaction
+    assert amount_ok(Decimal("-9.99"), AMOUNT_LT100, None, None) is True
+    assert amount_ok(Decimal("-120"), AMOUNT_MID, None, None) is True
+    assert amount_ok(Decimal("-120"), AMOUNT_GT500, None, None) is False
+    assert amount_ok(Decimal("-750"), AMOUNT_GT500, None, None) is True
+    # boundaries: 100–500 is inclusive; <100 is strict
+    assert amount_ok(Decimal("-100"), AMOUNT_MID, None, None) is True
+    assert amount_ok(Decimal("-100"), AMOUNT_LT100, None, None) is False
+
+
+def test_amount_ok_all_and_none():
+    assert amount_ok(None, AMOUNT_ALL, None, None) is True       # ALL ignores value
+    assert amount_ok(None, AMOUNT_LT100, None, None) is False    # a blank fails a real filter
+
+
+def test_amount_ok_custom_bounds_inclusive_and_open():
+    assert amount_ok(Decimal("-120"), AMOUNT_CUSTOM, Decimal("50"), Decimal("200")) is True
+    assert amount_ok(Decimal("-40"), AMOUNT_CUSTOM, Decimal("50"), Decimal("200")) is False
+    assert amount_ok(Decimal("-250"), AMOUNT_CUSTOM, Decimal("50"), Decimal("200")) is False
+    # None bounds are open on that side
+    assert amount_ok(Decimal("-9999"), AMOUNT_CUSTOM, Decimal("50"), None) is True
+    assert amount_ok(Decimal("-5"), AMOUNT_CUSTOM, None, Decimal("200")) is True
+
+
+def test_sort_value_types():
+    assert sort_value(entry("-500"), "amount") == Decimal("-500")   # signed, not magnitude
+    assert sort_value(entry(""), "amount") is None                  # blank sorts last
+    assert sort_value(entry(ri=2), "rule") == 2
+    assert sort_value(entry(ri=None), "rule") is None
+    assert sort_value(entry(account="ZChase"), "account") == "zchase"   # casefold
+    assert sort_value(entry(old="Food", new="Rent"), "from") == "food"
+    assert sort_value(entry(old="Food", new="Rent"), "to") == "rent"
+
+
+def test_view_account_filter():
+    es = [entry(account="chase"), entry(account="apple"), entry(account="chase")]
+    kept = view_entries(es, {"chase"}, None, None, True)
+    assert [e.row["account"] for e in kept] == ["chase", "chase"]
+    # None means every account (no-op)
+    assert view_entries(es, None, None, None, True) == es
+    # empty selection hides everything
+    assert view_entries(es, set(), None, None, True) == []
+
+
+def test_view_amount_and_account_compose_and():
+    es = [entry("-9", account="chase"), entry("-900", account="chase"),
+          entry("-900", account="apple")]
+    kept = view_entries(es, {"chase"}, (AMOUNT_GT500, None, None), None, True)
+    assert len(kept) == 1 and kept[0].row["account"] == "chase" and kept[0].row["amount"] == "-900"
+
+
+def test_view_sort_amount_numeric_not_lexical():
+    es = [entry("-500"), entry("-5"), entry("-100")]
+    asc = view_entries(es, None, None, "amount", True)
+    assert [e.row["amount"] for e in asc] == ["-500", "-100", "-5"]
+    desc = view_entries(es, None, None, "amount", False)
+    assert [e.row["amount"] for e in desc] == ["-5", "-100", "-500"]
+
+
+def test_view_sort_puts_blanks_last_both_directions():
+    es = [entry("-5"), entry(""), entry("-100")]
+    asc = view_entries(es, None, None, "amount", True)
+    desc = view_entries(es, None, None, "amount", False)
+    assert asc[-1].row["amount"] == "" and desc[-1].row["amount"] == ""
+
+
+def test_view_no_sort_preserves_source_order():
+    es = [entry("-5"), entry("-500"), entry("-100")]
+    assert view_entries(es, None, None, None, True) == es
+
+
+# --- rule search (category candidates) ---
+
+
+def test_rule_categories_distinct_nonempty_sorted():
+    rules = [rule("Zebra", "A"), rule("apple", "B"), rule("apple", "C"),
+             rule("", "D")]  # duplicate + an uncategorized rule
+    # casefold sort, no blanks, deduped
+    assert rule_categories(rules) == ["apple", "Zebra"]
+
+
+def test_rule_categories_empty_when_no_categories():
+    assert rule_categories([rule("", "A")]) == []
+
+
+def test_match_categories_substring_case_insensitive():
+    cats = ["Food/Dining", "Food/Snacks", "Rent", "Transit"]
+    assert match_categories(cats, "food") == ["Food/Dining", "Food/Snacks"]
+    assert match_categories(cats, "IT") == ["Transit"]   # substring, not prefix
+    assert match_categories(cats, "") == cats            # empty -> all, order kept
+    assert match_categories(cats, "zzz") == []
+
+
+# --- filter option counts ---
+
+
+def test_account_counts_tallies_per_account():
+    es = [entry(account="chase"), entry(account="apple"), entry(account="chase"),
+          entry(account="")]
+    assert account_counts(es) == {"chase": 2, "apple": 1, "": 1}
+
+
+def test_amount_counts_by_magnitude_bucket():
+    es = [entry("-9"), entry("-250"), entry("-750"), entry("-120"), entry("")]
+    c = amount_counts(es, None, None)
+    assert c[AMOUNT_ALL] == 5                 # every entry, incl. the blank
+    assert c[AMOUNT_LT100] == 1               # -9
+    assert c[AMOUNT_MID] == 2                 # -250, -120
+    assert c[AMOUNT_GT500] == 1               # -750
+    assert c[AMOUNT_CUSTOM] == 4              # open bounds -> every numeric (blank drops)
+
+
+def test_amount_counts_custom_uses_bounds():
+    es = [entry("-9"), entry("-250"), entry("-750"), entry("-120")]
+    assert amount_counts(es, Decimal("100"), Decimal("300"))[AMOUNT_CUSTOM] == 2  # -250, -120

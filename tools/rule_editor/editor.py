@@ -17,17 +17,23 @@ import copy
 import csv
 import os
 import sys
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 # The tier-3a rule engine (rules.py) is the pipeline's canonical copy in lib/;
 # both this editor and lib/categorizer.py import it so they categorize
 # identically. Put lib/ on the path before importing it (preview.py imports it
 # too). See plan.md §5.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "lib"))
+# tools/ holds tool_theme (the palette + macOS light/dark detection shared with
+# tools/review_approver).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import dearpygui.dearpygui as dpg  # noqa: E402
 
+import preview  # noqa: E402
+import tool_theme  # noqa: E402
 from preview import build_entries, changed, group_by_category, uncategorized  # noqa: E402
 from rules import (  # noqa: E402
     DEFAULT_COLUMNS, MATCH_MODES, OPS, Condition, Rule, load_rules, match_rule,
@@ -35,28 +41,18 @@ from rules import (  # noqa: E402
 )
 
 
-def _rgb(value: str) -> List[int]:
-    value = value.lstrip("#")
-    return [int(value[i:i + 2], 16) for i in (0, 2, 4)]
-
-
-# Claude-ish warm palette.
-BG = _rgb("#FAF9F5")
-SURFACE = _rgb("#FFFFFF")
-TEXT = _rgb("#3D3929")
-MUTED = _rgb("#83827D")
-ACCENT = _rgb("#D97757")
-ACCENT_ACTIVE = _rgb("#C4623F")
-BORDER = _rgb("#E5E4DF")
-DANGER = _rgb("#B54A34")
-WHITE = [255, 255, 255]
-# a touch darker than BORDER so the table header reads as a header, not a row
-TABLE_HEADER = _rgb("#EAE8E1")
+# The Claude-ish warm palette lives in tool_theme (shared with review_approver).
+# Load the light values into module scope as the bare names the theme builders
+# and inline `color=` args reference (BG, SURFACE, TEXT, MUTED, ACCENT,
+# ACCENT_ACTIVE, BORDER, DANGER, WHITE, TABLE_HEADER). main() re-applies the
+# resolved palette before building, and apply_theme() swaps it live on toggle.
+globals().update(tool_theme.LIGHT)
 
 MAIN = "main_window"
 RULES_BOX = "rules_box"
 SAVE_BTN = "save_button"
 PREVIEW_BTN = "preview_button"
+THEME_BTN = "theme_button"
 DIRTY_TXT = "dirty_text"
 FOOTER_TXT = "footer_text"
 ALERT = "alert_modal"
@@ -66,8 +62,22 @@ PANEL = "panel"
 # ~20 `<main>/<sub>` categories, and a scrolling row of that many tabs is worse
 # to navigate than a dropdown.
 PANEL_TABSTRIP = "panel_tabstrip"
+# The filter bar sits between the tab strip and the table: Account / Amount
+# multi-select popups + a header-click sort, all a pure view over the snapshot.
+PANEL_FILTERBAR = "panel_filterbar"
+FILTER_COUNT_TXT = "filter_count_text"
 PANEL_CONTENT = "panel_content"
 TABSTRIP_H = 52
+FILTERBAR_H = 40
+
+# Rule search: an input whose text filters the rule cards by category, with a
+# floating autocomplete dropdown of existing categories (mirrors the category
+# autocomplete in tools/review_approver).
+RULE_SEARCH = "rule_search"
+SUGGEST = "rule_suggest"        # the shared floating candidate list
+SUGGEST_W = 240
+SUGGEST_H = 260                 # bounded; the list scrolls past this
+SUGGEST_MAX = 60                # cap the rendered rows
 
 # Transactions panel. 680 leaves ~700 for the rules column at the default 1400
 # viewport, which is what a card needs once laid out tightly.
@@ -102,6 +112,29 @@ EMPTY_MESSAGE = {
     KEY_UNCAT: "every row matches a rule",
 }
 
+# Amount-filter radio options (label shown, kind from preview.py). Order matters:
+# it's the on-screen order and the radio's item list.
+AMOUNT_OPTIONS = [
+    ("All", preview.AMOUNT_ALL),
+    ("< 100", preview.AMOUNT_LT100),
+    ("100–500", preview.AMOUNT_MID),
+    ("> 500", preview.AMOUNT_GT500),
+    ("Custom", preview.AMOUNT_CUSTOM),
+]
+AMOUNT_KIND_BY_LABEL = {label: kind for label, kind in AMOUNT_OPTIONS}
+AMOUNT_LABEL_BY_KIND = {kind: label for label, kind in AMOUNT_OPTIONS}
+
+
+def _parse_decimal(text: str) -> Optional[Decimal]:
+    """A custom-range bound: blank or non-numeric means an open (unset) bound."""
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        return Decimal(text)
+    except InvalidOperation:
+        return None
+
 # candidates tried in order; DPG's built-in font is tiny on a retina display
 FONT_CANDIDATES = [
     "/System/Library/Fonts/SFNS.ttf",
@@ -120,6 +153,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--preview-csv", type=Path, default=None,
                    help="normalized CSV to count matches against; "
                         "defaults to the newest batch/*/normalized_*.csv under the data root")
+    p.add_argument("--theme", choices=["auto", "light", "dark"], default="auto",
+                   help="auto follows the macOS setting; the in-app button toggles after launch")
     return p.parse_args()
 
 
@@ -270,12 +305,19 @@ def combo_tab_themes() -> Tuple[str, str]:
 def init_font() -> None:
     # DPG's built-in font is tiny on a retina display. A missing font must never
     # be fatal — fall back to scaling the built-in one.
+    # A font loads only basic Latin by default, so glyphs beyond it render as a
+    # "not found" box (a question-mark-looking tofu). Load the few we use: the
+    # down-triangle on the filter buttons and the en/em dashes.
+    extra = [0x2013, 0x2014, 0x25BC]
     for candidate in FONT_CANDIDATES:
         if not Path(candidate).is_file():
             continue
         try:
             with dpg.font_registry():
-                dpg.bind_font(dpg.add_font(candidate, 17))
+                with dpg.font(candidate, 17) as font:
+                    dpg.add_font_range_hint(dpg.mvFontRangeHint_Default)
+                    dpg.add_font_chars(extra)
+                dpg.bind_font(font)
             return
         except Exception:
             continue
@@ -305,7 +347,9 @@ class RuleEditor:
         # or a malformed yaml is a clean CLI error, not a half-drawn window.
         self.rules: List[Rule] = rules
         self.baseline: List[Rule] = copy.deepcopy(self.rules)
-        self.count_tags: List[int] = []
+        # rule index -> its count-text id; a dict (not a list) so the cards can be
+        # rendered filtered without the index mapping drifting off the model.
+        self.count_tags: Dict[int, int] = {}
         self.accent = accent_theme()
         self.tab_active, self.tab_inactive = tab_themes()
         self.combo_active, self.combo_inactive = combo_tab_themes()
@@ -315,6 +359,13 @@ class RuleEditor:
         # have no scrollbar, so a short card clips instead of complaining.
         self.row_h = ROW_H
         self.calibrated = False
+
+        # theming: main() sets theme_name (the resolved "light"/"dark") and
+        # global_theme (the bound theme id) so apply_theme can rebuild + rebind
+        # on the toggle. The per-item themes above already read the palette main
+        # applied before this object was constructed.
+        self.theme_name = "light"
+        self.global_theme: Optional[int] = None
 
         # transactions panel state. The panel is always visible when a CSV is
         # loaded (never toggled); Preview is a manual refresh, not a show/hide.
@@ -327,6 +378,38 @@ class RuleEditor:
         # rules as of the last Preview; None = never previewed. Drives the stale
         # marker: when self.rules diverges from this, a refresh is pending.
         self.panel_snapshot: Optional[List[Rule]] = None
+
+        # panel filter/sort — a pure view over the snapshot (see preview.py),
+        # session-only, invisible to categorization. Accounts are tab-independent
+        # (from all rows), so the filter bar is built once and never rebuilt.
+        self.accounts: List[str] = preview.distinct_accounts(self.rows)
+        self.account_selected: Set[str] = set(self.accounts)   # all checked
+        self.amount_kind: str = preview.AMOUNT_ALL
+        self.amount_lo: Optional[Decimal] = None
+        self.amount_hi: Optional[Decimal] = None
+        # sort is native (click a header): _on_sort reorders these rows in place
+        self._sort_cols: Dict[int, str] = {}   # table column id -> label
+        self._row_entries: List[Tuple[int, "PreviewEntry"]] = []  # (row id, entry)
+        # filter-bar widget ids, set in _build_filterbar (needed by Select all /
+        # Clear to push values back into the checkboxes and radio)
+        self._account_checks: Dict[str, int] = {}
+        self._amount_radio: Optional[int] = None
+        self._amount_min: Optional[int] = None
+        self._amount_max: Optional[int] = None
+        # radio labels carry a per-option `(n)` count, so map a clicked label back
+        # to its kind by position rather than by text
+        self._amount_labels: List[str] = [label for label, _ in AMOUNT_OPTIONS]
+
+        # rule search: rule_query filters which cards render; the ac_* state drives
+        # the floating category autocomplete. input_text has no per-keystroke
+        # callback, so tick() polls the focused box each frame (as review_approver).
+        self.rule_query = ""
+        self.ac_input: Optional[int] = None       # the search box while its list is open
+        self.ac_query: Optional[str] = None       # last-seen text, for change detection
+        self.ac_shown = False                     # is the dropdown visible
+        self.ac_pos: Optional[Tuple[int, int]] = None   # where we placed it (viewport coords)
+        self.ac_grace: Optional[int] = None       # frame to auto-close at after a blur
+        self.ac_registry: Optional[int] = None    # the focus-handler registry
 
     # --- layout ---
 
@@ -345,7 +428,15 @@ class RuleEditor:
                 dpg.add_button(label="Save", tag=SAVE_BTN, width=90, enabled=False,
                                callback=self.save)
                 dpg.bind_item_theme(SAVE_BTN, self.accent)
+                dpg.add_button(label=self._theme_label(), tag=THEME_BTN, width=90,
+                               callback=self.toggle_theme)
             dpg.add_separator()
+            with dpg.group(horizontal=True):
+                # filter the rule cards by category; the floating list under the
+                # box autocompletes existing categories (see _bind_autocomplete)
+                dpg.add_text("Filter rules by category:", color=MUTED)
+                dpg.add_input_text(tag=RULE_SEARCH, hint="type or pick a category", width=240)
+                dpg.add_button(label="Clear", width=70, callback=self._clear_rule_search)
             with dpg.group(horizontal=True):
                 # the rules column yields the panel's width plus the gap whenever
                 # the panel is shown (i.e. whenever a csv is loaded)
@@ -354,15 +445,71 @@ class RuleEditor:
                 with dpg.child_window(tag=PANEL, width=PANEL_W, height=-38,
                                       show=self.panel_shown):
                     # the strip holds the two fixed tab buttons + the Categories
-                    # combo; the content area below holds only the active table
+                    # combo; the filter bar the Account/Amount popups + row count;
+                    # the content area below holds only the active table
                     dpg.add_child_window(tag=PANEL_TABSTRIP, height=TABSTRIP_H,
+                                         border=False)
+                    dpg.add_child_window(tag=PANEL_FILTERBAR, height=FILTERBAR_H,
                                          border=False)
                     dpg.add_child_window(tag=PANEL_CONTENT, height=-1, border=False)
             dpg.add_text("", tag=FOOTER_TXT, color=MUTED)
         dpg.set_primary_window(MAIN, True)
+        # the autocomplete list floats over everything, hidden until the search box
+        # is focused; no_focus_on_appearing keeps the keyboard in the box so typing
+        # keeps filtering.
+        with dpg.window(tag=SUGGEST, show=False, no_title_bar=True, no_move=True,
+                        no_resize=True, no_collapse=True, no_focus_on_appearing=True,
+                        no_scrollbar=False, width=SUGGEST_W, height=SUGGEST_H):
+            pass
+        self._bind_autocomplete(RULE_SEARCH)
         self.render()
+        # the filter bar is static (accounts don't change), so build it once
+        if self.panel_shown:
+            self._build_filterbar()
         # populate the panel's initial snapshot so it isn't blank on launch
         self._render_panel()
+
+    # --- theming ---
+
+    def _theme_label(self) -> str:
+        # the button shows what you'll switch TO
+        return "Light" if self.theme_name == "dark" else "Dark"
+
+    def toggle_theme(self, *_) -> None:
+        self.apply_theme("light" if self.theme_name == "dark" else "dark")
+
+    def apply_theme(self, name: str) -> None:
+        """Swap the whole UI to the light/dark palette live.
+
+        DPG doesn't cascade a palette change to existing widgets, so we reassign
+        the module colour constants, rebuild + rebind every theme item, update
+        the viewport background (baked in at creation, not the theme), and poke
+        the few persistent widgets that carry an inline colour. render() rebuilds
+        the cards and the panel rebuilds its table, so their colours follow.
+        """
+        self.theme_name = name
+        globals().update(tool_theme.palette(name))
+        # global theme: rebuild + rebind, delete the old to avoid a per-toggle leak
+        if self.global_theme is not None:
+            dpg.delete_item(self.global_theme)
+        self.global_theme = init_theme()
+        dpg.set_viewport_clear_color(BG + [255])
+        # per-item themes: delete olds, rebuild from the new globals, re-bind
+        for t in (self.accent, self.tab_active, self.tab_inactive,
+                  self.combo_active, self.combo_inactive):
+            dpg.delete_item(t)
+        self.accent = accent_theme()
+        self.tab_active, self.tab_inactive = tab_themes()
+        self.combo_active, self.combo_inactive = combo_tab_themes()
+        dpg.bind_item_theme(SAVE_BTN, self.accent)
+        # persistent inline-coloured toolbar/footer texts
+        dpg.configure_item(DIRTY_TXT, color=ACCENT)
+        dpg.configure_item(FOOTER_TXT, color=MUTED)
+        dpg.configure_item(THEME_BTN, label=self._theme_label())
+        self.render()                 # rebuilds cards; calls refresh() (recolours counts)
+        if self.panel_shown:          # tab themes + empty-msg MUTED live in the panel
+            self._paint_tabs()
+            self._render_content()
 
     # --- rendering ---
 
@@ -374,13 +521,20 @@ class RuleEditor:
         rebuilds it. refresh() only updates the dirty state and the stale marker.
         """
         dpg.delete_item(RULES_BOX, children_only=True)
-        self.count_tags = []
+        self.count_tags = {}
 
         for i, rule in enumerate(self.rules):
-            self._render_rule(i, rule)
+            if self._rule_visible(rule):
+                self._render_rule(i, rule)
 
         dpg.add_button(label="+ rule", parent=RULES_BOX, callback=self.add_rule, width=110)
         self.refresh()
+
+    def _rule_visible(self, rule: Rule) -> bool:
+        # filter by the search box's category substring. An uncategorized rule
+        # always shows, so adding a rule while a filter is active isn't a no-op.
+        q = self.rule_query.casefold()
+        return not q or not rule.category or q in rule.category.casefold()
 
     def _schedule_render(self) -> None:
         # Never restructure inside the callback of a widget being deleted —
@@ -421,7 +575,7 @@ class RuleEditor:
                 dpg.add_combo(items=list(MATCH_MODES), default_value=rule.match, width=70,
                               user_data=index, callback=self._on_match)
                 dpg.add_spacer(width=4)
-                self.count_tags.append(dpg.add_text("", color=MUTED))
+                self.count_tags[index] = dpg.add_text("", color=MUTED)
                 dpg.add_spacer(width=4)
                 dpg.add_button(label="x", width=26, user_data=index,
                                callback=lambda s, a, u: self.delete_rule(u))
@@ -462,9 +616,130 @@ class RuleEditor:
         self.refresh()
 
     def tick(self) -> None:
-        """Called once per frame from the render loop; drives first-frame calibration."""
+        """Called once per frame from the render loop; drives first-frame
+        calibration and the rule-search autocomplete."""
         if not self.calibrated:
             self._calibrate()
+        self._ac_tick()
+
+    # --- rule search / category autocomplete (mirrors review_approver) ----
+
+    def _bind_autocomplete(self, item: int) -> None:
+        # Open on a real mouse CLICK, not on focus. A structural edit (+ rule /
+        # + condition) deletes the clicked button, and DPG then shifts keyboard
+        # focus to the nearest input — this search box — which a focus handler
+        # would read as "opened", popping the list unbidden. A click can't be
+        # synthesised that way, and "click to open" is the intended behaviour.
+        with dpg.item_handler_registry() as reg:
+            dpg.add_item_clicked_handler(callback=self._ac_open, user_data=item)
+        dpg.bind_item_handler_registry(item, reg)
+        self.ac_registry = reg
+
+    def _ac_open(self, sender, app_data, user_data) -> None:
+        item = user_data
+        # clicking the box while its list is already open is a no-op; _ac_tick
+        # owns refiltering from there.
+        if self.ac_input == item:
+            return
+        self.ac_input = item
+        # anchor the list just under the box; remember where — the hit-test reads
+        # this, never the window's (fragile) render state.
+        x, y = dpg.get_item_rect_min(item)
+        h = dpg.get_item_rect_size(item)[1]
+        self.ac_pos = (int(x), int(y + h))
+        self.ac_grace = None
+        dpg.configure_item(SUGGEST, pos=list(self.ac_pos))
+        value = dpg.get_value(item)
+        self.ac_query = value
+        self._ac_populate(value)
+
+    def _ac_populate(self, query: str) -> None:
+        matches = preview.match_categories(preview.rule_categories(self.rules), query)
+        dpg.delete_item(SUGGEST, children_only=True)
+        if not matches:
+            dpg.configure_item(SUGGEST, show=False)
+            self.ac_shown = False
+            return
+        for m in matches[:SUGGEST_MAX]:
+            dpg.add_selectable(label=m, parent=SUGGEST, user_data=m, callback=self._ac_pick)
+        dpg.configure_item(SUGGEST, show=True)
+        self.ac_shown = True
+
+    def _ac_pick(self, sender, app_data, user_data) -> None:
+        if self.ac_input is None:
+            return
+        category = user_data
+        dpg.set_value(self.ac_input, category)   # set_value skips the callback
+        self._ac_close()
+        self._apply_rule_search(category)        # show that category's rules
+
+    def _ac_close(self) -> None:
+        if dpg.does_item_exist(SUGGEST):
+            dpg.configure_item(SUGGEST, show=False)
+            dpg.delete_item(SUGGEST, children_only=True)
+        self.ac_input = None
+        self.ac_query = None
+        self.ac_shown = False
+        self.ac_pos = None
+        self.ac_grace = None
+
+    def _suggest_hovered(self) -> bool:
+        # keep the list open while the mouse is over it, so a click on a suggestion
+        # (which blurs the box) doesn't race the dismissal. Avoids reading the
+        # floating window's rect (can be missing mid-frame); hit-tests the position
+        # we set it to instead.
+        if not self.ac_shown:
+            return False
+        try:
+            if dpg.is_item_hovered(SUGGEST):
+                return True
+        except Exception:
+            pass
+        if self.ac_pos is None:
+            return False
+        try:
+            mx, my = dpg.get_mouse_pos(local=False)
+        except Exception:
+            return False
+        x, y = self.ac_pos
+        return x <= mx <= x + SUGGEST_W and y <= my <= y + SUGGEST_H
+
+    def _apply_rule_search(self, text: str) -> None:
+        # the box's text is the filter; re-render the cards when it changes
+        if text == self.rule_query:
+            return
+        self.rule_query = text
+        self.render()
+
+    def _clear_rule_search(self, *_) -> None:
+        dpg.set_value(RULE_SEARCH, "")
+        self.ac_query = ""
+        self._ac_close()
+        self._apply_rule_search("")
+
+    def _ac_tick(self) -> None:
+        if self.ac_input is None:
+            return
+        if not dpg.does_item_exist(self.ac_input):
+            self._ac_close()
+            return
+        if dpg.is_item_focused(self.ac_input):
+            self.ac_grace = None                       # active box — cancel pending close
+            cur = dpg.get_value(self.ac_input)
+            if cur != self.ac_query:                   # refilter as you type
+                self.ac_query = cur
+                self._ac_populate(cur)
+                self._apply_rule_search(cur)
+            return
+        # focus left the box: keep the list open while the mouse is over it, and
+        # give a few frames' grace so a click on a suggestion lands first.
+        if self._suggest_hovered():
+            self.ac_grace = None
+            return
+        if self.ac_grace is None:
+            self.ac_grace = dpg.get_frame_count() + 6
+        elif dpg.get_frame_count() >= self.ac_grace:
+            self._ac_close()
 
     def _tab_specs(self) -> List[Tuple[str, str, List]]:
         """(key, label, entries) for every tab, in display order."""
@@ -529,13 +804,165 @@ class RuleEditor:
             dpg.bind_item_theme(
                 self.cat_combo, self.combo_active if cat_active else self.combo_inactive)
 
-    def _render_content(self) -> None:
+    # --- filter bar (account / amount) ---------------------------------
+
+    def _build_filterbar(self) -> None:
+        """Build the Account/Amount popups + row count once. Static — accounts
+        come from all rows, not the active tab, so this never rebuilds."""
+        with dpg.group(horizontal=True, parent=PANEL_FILTERBAR):
+            amt_btn = dpg.add_button(label="Amount ▼", width=110)
+            with dpg.popup(amt_btn, mousebutton=dpg.mvMouseButton_Left):
+                self._amount_radio = dpg.add_radio_button(
+                    items=[label for label, _ in AMOUNT_OPTIONS],
+                    default_value=AMOUNT_LABEL_BY_KIND[self.amount_kind],
+                    callback=self._on_amount_kind)
+                dpg.add_separator()
+                dpg.add_text("Custom range (magnitude):", color=MUTED)
+                with dpg.group(horizontal=True):
+                    # on_enter so we filter on commit, not on every keystroke
+                    self._amount_min = dpg.add_input_text(
+                        hint="min", width=90, on_enter=True,
+                        user_data="lo", callback=self._on_amount_bound)
+                    dpg.add_text("–")
+                    self._amount_max = dpg.add_input_text(
+                        hint="max", width=90, on_enter=True,
+                        user_data="hi", callback=self._on_amount_bound)
+
+            acct_btn = dpg.add_button(label="Account ▼", width=110)
+            with dpg.popup(acct_btn, mousebutton=dpg.mvMouseButton_Left):
+                with dpg.group(horizontal=True):
+                    dpg.add_button(label="Select all", callback=self._select_all_accounts)
+                    dpg.add_button(label="Unselect all", callback=self._unselect_all_accounts)
+                dpg.add_separator()
+                self._account_checks = {}
+                for acct in self.accounts:
+                    label = acct or "(blank)"
+                    self._account_checks[acct] = dpg.add_checkbox(
+                        label=label, default_value=True,
+                        user_data=acct, callback=self._on_account_toggle)
+
+            dpg.add_button(label="Clear", width=70, callback=self._clear_filters)
+            dpg.add_text("", tag=FILTER_COUNT_TXT, color=MUTED)
+
+    def _on_account_toggle(self, sender, checked, account) -> None:
+        if checked:
+            self.account_selected.add(account)
+        else:
+            self.account_selected.discard(account)
+        self._apply_view()
+
+    def _select_all_accounts(self, *_) -> None:
+        self.account_selected = set(self.accounts)
+        for cid in self._account_checks.values():
+            dpg.set_value(cid, True)
+        self._apply_view()
+
+    def _unselect_all_accounts(self, *_) -> None:
+        self.account_selected = set()
+        for cid in self._account_checks.values():
+            dpg.set_value(cid, False)
+        self._apply_view()
+
+    def _on_amount_kind(self, sender, label, user_data=None) -> None:
+        # labels carry a `(n)` count, so map back to the kind by position
+        try:
+            idx = self._amount_labels.index(label)
+        except ValueError:
+            return
+        self.amount_kind = AMOUNT_OPTIONS[idx][1]
+        self._apply_view()
+
+    def _on_amount_bound(self, sender, text, which) -> None:
+        # editing a bound implies a custom range; the radio selection is synced by
+        # _update_filter_counts (which owns the counted labels)
+        value = _parse_decimal(text)
+        if which == "lo":
+            self.amount_lo = value
+        else:
+            self.amount_hi = value
+        self.amount_kind = preview.AMOUNT_CUSTOM
+        self._apply_view()
+
+    def _clear_filters(self, *_) -> None:
+        self.account_selected = set(self.accounts)
+        for cid in self._account_checks.values():
+            dpg.set_value(cid, True)
+        self.amount_kind = preview.AMOUNT_ALL
+        self.amount_lo = self.amount_hi = None
+        if self._amount_min is not None:
+            dpg.set_value(self._amount_min, "")
+        if self._amount_max is not None:
+            dpg.set_value(self._amount_max, "")
+        self._apply_view()   # _update_filter_counts re-selects the radio to "All"
+
+    def _apply_view(self, *_) -> None:
+        # every filter/sort change funnels here; only the table is rebuilt, so the
+        # open popup (a child of a filter-bar button) is untouched and stays open
+        self._render_content()
+
+    def _update_filter_counts(self) -> None:
+        """Label each Account/Amount option with how many active-tab rows it holds.
+
+        Counts are over the FULL tab entries, not the filtered view, so they show
+        the distribution to pick from and don't shift as you toggle other options.
+        """
+        if not self._account_checks or self._amount_radio is None:
+            return
+        entries = self.tab_entries.get(self.active_tab, [])
+        acc = preview.account_counts(entries)
+        for acct, cid in self._account_checks.items():
+            name = acct or "(blank)"
+            dpg.configure_item(cid, label=f"{name} ({acc.get(acct, 0)})")
+        amt = preview.amount_counts(entries, self.amount_lo, self.amount_hi)
+        self._amount_labels = [f"{base} ({amt[kind]})" for base, kind in AMOUNT_OPTIONS]
+        dpg.configure_item(self._amount_radio, items=self._amount_labels)
+        sel = [kind for _, kind in AMOUNT_OPTIONS].index(self.amount_kind)
+        dpg.set_value(self._amount_radio, self._amount_labels[sel])   # skips the callback
+
+    # --- sort (click a column header) ----------------------------------
+
+    def _on_sort(self, sender, app_data, user_data=None) -> None:
+        # sender is the table. We REORDER the existing rows in place rather than
+        # rebuilding the table: a rebuild draws the fresh rows over the old ones
+        # for a frame, which showed up as ghosted/doubled text. app_data is
+        # [[column_id, direction], ...]; empty on the tristate "off" click, which
+        # restores the original (build) order. direction is +1 asc / -1 desc.
+        if not self._row_entries:
+            return
+        if not app_data:
+            order = [row_id for row_id, _ in self._row_entries]
+        else:
+            col_id, direction = app_data[0]
+            column = self._sort_cols.get(col_id)
+            ascending = direction > 0
+            # blanks (empty amount / no rule) sort last in either direction
+            present = [(r, e) for r, e in self._row_entries
+                       if preview.sort_value(e, column) is not None]
+            missing = [(r, e) for r, e in self._row_entries
+                       if preview.sort_value(e, column) is None]
+            present.sort(key=lambda re: preview.sort_value(re[1], column),
+                         reverse=not ascending)
+            order = [r for r, _ in present] + [r for r, _ in missing]
+        dpg.reorder_items(sender, 1, order)   # slot 1 = the table's rows
+
+    def _render_content(self, *_) -> None:
         # Only the active tab's table exists at a time. dpg's table clipper skips
         # drawing off-screen rows but not their widget creation, so building
         # every tab would mean tens of thousands of text items on a 1400-row csv.
+        # Filtering rebuilds the table (source order); sorting reorders in place
+        # (_on_sort), so a rebuild here never re-sorts — the sort simply resets.
         dpg.delete_item(PANEL_CONTENT, children_only=True)
-        self._render_table(PANEL_CONTENT, self.active_tab,
-                           self.tab_entries.get(self.active_tab, []))
+        entries = self.tab_entries.get(self.active_tab, [])
+        self._update_filter_counts()
+        amount = ((self.amount_kind, self.amount_lo, self.amount_hi)
+                  if self.amount_kind != preview.AMOUNT_ALL else None)
+        # None = every account (no-op filter); anything narrower filters
+        accounts = (self.account_selected
+                    if set(self.account_selected) != set(self.accounts) else None)
+        view = preview.view_entries(entries, accounts, amount, None, True)
+        self._render_table(PANEL_CONTENT, self.active_tab, view)
+        if dpg.does_item_exist(FILTER_COUNT_TXT):
+            dpg.set_value(FILTER_COUNT_TXT, f"showing {len(view)} of {len(entries)}")
 
     def _on_tab(self, sender, app_data, user_data) -> None:
         if user_data == self.active_tab:
@@ -590,18 +1017,29 @@ class RuleEditor:
 
     def _render_table(self, parent: int, key: str, entries: List) -> None:
         if not entries:
-            dpg.add_text(EMPTY_MESSAGE.get(key, "no rows"), parent=parent, color=MUTED)
+            # distinguish "nothing here" from "a filter hid everything"
+            hidden = bool(self.tab_entries.get(key))
+            msg = "no rows match the filter" if hidden else EMPTY_MESSAGE.get(key, "no rows")
+            dpg.add_text(msg, parent=parent, color=MUTED)
             return
         clip_at = self._desc_clip_chars(key)
+        # sortable: clicking a header fires _on_sort, which reorders the rows in
+        # place (see _on_sort). _sort_cols maps a column id to its label;
+        # _row_entries pairs each row id with its entry so the sort has typed keys.
+        self._sort_cols = {}
+        self._row_entries = []
         with dpg.table(parent=parent, header_row=True, scrollY=True, freeze_rows=1,
                        row_background=True, resizable=True, borders_innerV=True,
                        borders_innerH=True, policy=dpg.mvTable_SizingStretchProp,
+                       sortable=True, sort_tristate=True, callback=self._on_sort,
                        height=-1):
             for label, weight in self._columns(key):
-                dpg.add_table_column(label=label, init_width_or_weight=weight)
+                col_id = dpg.add_table_column(label=label, init_width_or_weight=weight)
+                self._sort_cols[col_id] = label
             for entry in entries:
                 cells = self._cells(key, entry)
-                with dpg.table_row():
+                with dpg.table_row() as row_id:
+                    self._row_entries.append((row_id, entry))
                     for ci, cell in enumerate(cells):
                         txt = dpg.add_text(cell)
                         # full text on hover only when it's too long to fit,
@@ -612,12 +1050,12 @@ class RuleEditor:
 
     def _refresh_stale(self) -> None:
         # The panel is a snapshot from the last Preview. When the rules have
-        # since diverged, flag that a refresh is pending on the Preview button
-        # rather than silently showing stale categories.
+        # since diverged, flag that a refresh is pending by accenting the Preview
+        # button rather than silently showing stale categories. The accent colour
+        # carries the signal on its own, so the label stays a plain "Preview".
         if not self.panel_shown or self.panel_snapshot is None:
             return
         stale = self.rules != self.panel_snapshot
-        dpg.configure_item(PREVIEW_BTN, label="Preview ●" if stale else "Preview")
         dpg.bind_item_theme(PREVIEW_BTN, self.accent if stale else 0)
 
     # --- model edits (no re-render: keep focus while typing) ---
@@ -687,7 +1125,7 @@ class RuleEditor:
             return
 
         won, matched, uncategorized = self._tally()
-        for i, tag in enumerate(self.count_tags):
+        for i, tag in self.count_tags.items():
             if i >= len(won):
                 continue
             # "rows won" (first match), not "rows matched": a rule that matches
@@ -777,9 +1215,15 @@ def main() -> None:
     print(f"preview: {preview or 'none — match counts hidden'}", file=sys.stderr)
 
     dpg.create_context()
-    init_theme()
+    # Resolve + apply the palette BEFORE any theme or widget is built, so
+    # init_theme() and the editor's per-item themes read the right colours.
+    theme_name = tool_theme.resolve_theme(args.theme)
+    globals().update(tool_theme.palette(theme_name))
+    theme_id = init_theme()
     init_font()
     editor = RuleEditor(rules_path, rules, rows, columns)
+    editor.theme_name = theme_name
+    editor.global_theme = theme_id
     editor.build()
     # clear_color is 0-255, like every other dpg colour.
     # 1400 leaves the rules column ~700 with the panel open, which fits a card.

@@ -26,6 +26,11 @@ overrides. With no CSV the editor
 still works — counts are just hidden. The CSV is read **read-only**, once, and never copied
 or written anywhere.
 
+**Light / dark theme.** `--theme auto|light|dark` (default `auto`) picks the palette at
+launch — `auto` follows the macOS appearance setting. A `☾ Dark` / `☀ Light` button in the
+toolbar toggles it live thereafter (macOS can't be auto-followed mid-session). The palette
+and the detection live in `tools/tool_theme.py`, shared with `tools/review_approver`.
+
 Starting from scratch:
 
 ```sh
@@ -94,6 +99,13 @@ copy it over `keywords.yaml` yourself if you want it.
 Reorder rules with **▲▼**. Order is the semantics here, so it's worth being deliberate: if a
 rule reports `shadowed`, some rule above it already claims every row it would match.
 
+**Filter rules by category.** The search box above the rules narrows the cards to the rules
+of one category — useful once the table runs to ~20 categories. Click the empty box to see
+every category currently in use; type to narrow that list by substring; pick one (or just
+leave your typed text) and the cards collapse to the matching rules. Uncategorized rules
+always stay visible, so adding a rule while filtered isn't a dead end. **Clear** resets it.
+(The autocomplete mirrors the category picker in `tools/review_approver`.)
+
 The footer's uncategorized count is the M2 progress metric (`plan.md` §6 targets ~80%
 auto-categorized).
 
@@ -122,6 +134,26 @@ when you type a keyword's first letter and it still matches everything — and l
 few edits before judging their combined effect. Click **Preview** when you want the panel to
 catch up. (Save doesn't auto-refresh either, so the marker stays lit after a save until you
 press Preview.)
+
+**Filtering & sorting the panel.** A filter bar above the table narrows what you're reading —
+handy on a long Uncategorized worklist. It's a pure view over the current Preview snapshot: it
+never changes your rules, the match counts, or the footer's uncategorized metric.
+
+- **Sort** — click a column header to sort A→Z, click again for Z→A, a third time to clear
+  (the header shows the sort arrow). Rows reorder in place. Amount sorts numerically, not
+  lexically, so `-500` orders below `-5`.
+- **Account ▼** — a checkbox per account with **Select all / Unselect all**; the table shows
+  only the checked accounts.
+- **Amount ▼** — presets **< 100 / 100–500 / > 500** or a **Custom** min–max, compared on the
+  **magnitude** of the amount (spend is stored negative, so `< 100` means "under $100 in
+  size"). The custom bounds are inclusive; leave one blank for an open end.
+- Each Account and Amount option carries a `(n)` count — how many rows in the current tab it
+  holds. Counts are over the whole tab (not the already-filtered view), so they show the
+  distribution to pick from and don't shift as you toggle other options.
+- **Clear** resets everything, and *showing N of M* tracks how much the filter hides.
+
+Filters (account + amount) combine with AND and persist as you switch tabs; a sort applies to
+whatever tab has that column (the `from`/`to` columns only exist on Changed).
 
 A description too long for its column gets the full text in a hover tooltip. Only long ones —
 whether a description clips depends on the tab (the Changed tab's description column is
