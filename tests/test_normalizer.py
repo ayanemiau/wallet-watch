@@ -12,6 +12,7 @@ SCRIPTS = REPO / "scripts"
 DATA = REPO / "tests" / "fixtures" / "data"
 BATCH = DATA / "batch" / "20260101-20260131"
 BATCH2 = DATA / "batch" / "20260201-20260228"
+BATCH3 = DATA / "batch" / "20260301-20260331"
 
 sys.path.insert(0, str(LIB))
 sys.path.insert(0, str(SCRIPTS))
@@ -165,6 +166,33 @@ def test_capital_unknown_type_is_error(tmp_path):
     n = Normalizer()
     with pytest.raises(NormalizeError, match="unknown Capital transaction type"):
         n.inject(bad, "capital-saving", accounts["capitalXXXX"])
+
+
+def test_apple_flips_sign_and_composes_description():
+    # Apple signs the opposite way (like Discover), and ships a cleaned Merchant
+    # + its own Category, which the handler folds into original_description as
+    # "<Category> <Merchant> <Description>".
+    rows = inject_fixture("applecardXXXX_20260301_20260331.csv", BATCH3).transactions
+    assert len(rows) == 4
+    assert rows[0].account == "Fake Apple Card"          # Account.name, not id
+    assert all(r.is_reference is False for r in rows)    # stamped later, in reconcile
+    assert all(r.category == "" for r in rows)           # Apple's Category folds into
+    assert all(r.corrected_description == "" for r in rows)  # the description, not fields
+
+    # row 0: Transaction Date used; purchase (+12.00) -> spent; description already
+    # begins with the merchant, so the prepend is a tolerated duplicate.
+    assert rows[0].date == "2026-03-05"                  # Transaction Date, MM/DD/YYYY -> ISO
+    assert rows[0].amount == "-12.00"                    # purchase -> spent (flipped)
+    assert rows[0].original_description == \
+        "Grocery Fake Mart FAKE MART #0000 123 NOWHERE RD FAKETOWN 00000 CA USA"
+
+    # row 1: cleaned merchant differs from the SQ * description prefix -> still prepended
+    assert rows[1].original_description.startswith("Restaurants Fake Coffee SQ *FAKE COFFEE")
+
+    # row 2: payment (raw -500.00) -> received (flipped positive)
+    assert rows[2].amount == "500.00"
+    # row 3: Daily Cash "Debit" (raw +0.50) -> spent (flipped negative)
+    assert rows[3].amount == "-0.50"
 
 
 def test_wealthfront_passes_signed_amount():

@@ -45,4 +45,4 @@ def has_handler(type_: str) -> bool:
 
 
 # import for side effect: each module registers its types on import
-from . import capital, chase, discover, wealthfront  # noqa: E402,F401
+from . import apple, capital, chase, discover, wealthfront  # noqa: E402,F401
