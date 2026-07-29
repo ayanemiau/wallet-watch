@@ -1,0 +1,8 @@
+Date,Description,Category,Cost,Currency,me,Alice,Bob
+
+2026-04-05,Fake Grocery,Groceries,30.00,USD,-10.00,20.00,-10.00
+2026-04-10,Fake Dinner,Dining out,30.00,USD,20.00,-10.00,-10.00
+2026-04-15,me paid Alice,Payment,50.00,USD,50.00,-50.00,0.00
+2026-04-20,Fake Solo Snack,General,20.00,USD,0.00,10.00,-10.00
+
+2026-04-30,Total balance, , ,USD,10.00,-30.00,20.00

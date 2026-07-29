@@ -1,9 +1,10 @@
-id,name,type
-chaseXXXX,Fake Checking,chase-checking
-chaseYYYY,Fake Card,chase-credit
-chaseZZZZ,Fake Card Two,chase-credit
-discoverXXXX,Fake Discover,discover-credit
-capitalXXXX,Fake Capital,capital-saving
-wealthfrontXXXX,Fake Wealthfront,wealthfront-saving
-venmoXXXX,Fake Venmo,venmo
-applecardXXXX,Fake Apple Card,apple-credit
+id,name,type,handler_user
+chaseXXXX,Fake Checking,chase-checking,
+chaseYYYY,Fake Card,chase-credit,
+chaseZZZZ,Fake Card Two,chase-credit,
+discoverXXXX,Fake Discover,discover-credit,
+capitalXXXX,Fake Capital,capital-saving,
+wealthfrontXXXX,Fake Wealthfront,wealthfront-saving,
+venmoXXXX,Fake Venmo,venmo,
+applecardXXXX,Fake Apple Card,apple-credit,
+splitwise,Fake Splitwise,splitwise,me

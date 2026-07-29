@@ -98,6 +98,7 @@ def load_accounts(data_dir: Path) -> Dict[str, Account]:
                 name=row["name"].strip(),
                 type=row["type"].strip(),
                 description=(row.get("description") or "").strip(),
+                handler_user=(row.get("handler_user") or "").strip(),
             )
             accounts[account.id] = account
     if not accounts:
@@ -112,15 +113,19 @@ def account_id_from_filename(raw_file: Path) -> str:
 
 
 def date_range_from_filename(raw_file: Path) -> Tuple[str, str]:
-    # 3b. The two fields after the id are the export's window, YYYYMMDD each:
-    #     chaseXXXX_20250101_20260630.csv -> ("2025-01-01", "2026-06-30")
-    #     inject() then filters transactions to this inclusive range.
+    # 3b. The window is the LAST two underscore fields, YYYYMMDD each:
+    #     chaseXXXX_20250101_20260630.csv       -> ("2025-01-01", "2026-06-30")
+    #     splitwise_bond_20250101_20260630.csv  -> ("2025-01-01", "2026-06-30")
+    #     inject() then filters transactions to this inclusive range. Any field
+    #     between the id and the dates is a free label (e.g. a Splitwise group)
+    #     and is ignored here — the id is still the first field (account_id_...).
     parts = raw_file.stem.split("_")
-    if len(parts) != 3:
-        raise SystemExit(f"{raw_file.name}: expected <id>_<startYYYYMMDD>_<endYYYYMMDD>.csv")
+    if len(parts) < 3:
+        raise SystemExit(
+            f"{raw_file.name}: expected <id>[_<label>...]_<startYYYYMMDD>_<endYYYYMMDD>.csv")
     try:
-        start = datetime.strptime(parts[1], "%Y%m%d").strftime("%Y-%m-%d")
-        end = datetime.strptime(parts[2], "%Y%m%d").strftime("%Y-%m-%d")
+        start = datetime.strptime(parts[-2], "%Y%m%d").strftime("%Y-%m-%d")
+        end = datetime.strptime(parts[-1], "%Y%m%d").strftime("%Y-%m-%d")
     except ValueError as e:
         raise SystemExit(f"{raw_file.name}: bad date range in filename: {e}")
     return start, end

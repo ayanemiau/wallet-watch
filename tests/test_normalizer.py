@@ -13,6 +13,7 @@ DATA = REPO / "tests" / "fixtures" / "data"
 BATCH = DATA / "batch" / "20260101-20260131"
 BATCH2 = DATA / "batch" / "20260201-20260228"
 BATCH3 = DATA / "batch" / "20260301-20260331"
+BATCH4 = DATA / "batch" / "20260401-20260430"
 
 sys.path.insert(0, str(LIB))
 sys.path.insert(0, str(SCRIPTS))
@@ -193,6 +194,47 @@ def test_apple_flips_sign_and_composes_description():
     assert rows[2].amount == "500.00"
     # row 3: Daily Cash "Debit" (raw +0.50) -> spent (flipped negative)
     assert rows[3].amount == "-0.50"
+
+
+def test_splitwise_decomposes_rows_and_drops_summary():
+    # Splitwise's per-person column is a NET (paid - share). The handler reads
+    # the operator's column (accounts.csv handler_user = "me") and splits each
+    # row into up to two Transactions; the "Total balance" summary is dropped.
+    rows = inject_fixture(
+        "splitwise_fakegroup_20260401_20260430.csv", BATCH4).transactions
+    assert rows[0].account == "Fake Splitwise"           # Account.name, not id
+    assert all(r.is_reference is False for r in rows)     # stamped later
+    assert all(r.category == "" for r in rows)            # Category folds into desc
+
+    # owe-only (me=-10.00): one expense of the net; nothing paid out of pocket.
+    # fronted (me=+20.00, cost=30.00): expense of the share (20-30=-10) + a
+    #   reimbursement of the out-of-pocket (30.00) carrying the repaid token.
+    # settle (me=+50.00, cost=50.00): share expense is 0 and dropped, so only
+    #   the 50.00 reimbursement survives.
+    # not-involved (me=0.00) and "Total balance" both emit nothing.
+    by_desc = {(r.original_description, r.amount) for r in rows}
+    assert ("Groceries Fake Grocery", "-10.00") in by_desc          # owe-only
+    assert ("Dining out Fake Dinner", "-10.00") in by_desc          # fronted share
+    assert ("Dining out Fake Dinner splitwise-repaid", "30.00") in by_desc
+    assert ("Payment me paid Alice splitwise-repaid", "50.00") in by_desc
+    assert len(rows) == 4                                 # 1 + 2 + 1, others skipped
+    assert not any("Fake Solo Snack" in r.original_description for r in rows)
+    assert not any(r.original_description.startswith("Total balance") for r in rows)
+
+    # the two rows of the fronted expense sum to the operator's net (+20.00)
+    fronted = [r for r in rows if "Fake Dinner" in r.original_description]
+    assert sum(float(r.amount) for r in fronted) == 20.00
+
+
+def test_splitwise_missing_handler_user_is_error(tmp_path):
+    bad = tmp_path / "splitwise_g_20260401_20260430.csv"
+    bad.write_text("Date,Description,Category,Cost,Currency,me\n"
+                   "2026-04-05,Fake,General,10.00,USD,-10.00\n")
+    # an account whose handler_user names a column absent from the export
+    account = Account(id="splitwise", name="Fake Splitwise", type="splitwise",
+                      handler_user="nobody")
+    with pytest.raises(NormalizeError, match="no column 'nobody'"):
+        Normalizer().inject(bad, "splitwise", account)
 
 
 def test_wealthfront_passes_signed_amount():

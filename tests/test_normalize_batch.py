@@ -44,6 +44,15 @@ def test_date_range_from_filename():
         ("2025-01-01", "2026-06-30")
 
 
+def test_date_range_ignores_label_segment():
+    # a Splitwise group label sits between the id and the dates; the window is
+    # still the last two fields, and the id is still the first (below).
+    assert date_range_from_filename(Path("splitwise_bond_20250101_20260630.csv")) == \
+        ("2025-01-01", "2026-06-30")
+    assert account_id_from_filename(Path("splitwise_bond_20250101_20260630.csv")) == \
+        "splitwise"
+
+
 def test_malformed_filename_is_hard_error(tmp_path):
     # a name without the <id>_<start>_<end> shape exits non-zero
     batch = tmp_path / "20260101-20260131"
@@ -55,7 +64,7 @@ def test_malformed_filename_is_hard_error(tmp_path):
         capture_output=True, text=True,
     )
     assert r.returncode != 0
-    assert "expected <id>_<startYYYYMMDD>_<endYYYYMMDD>" in r.stderr
+    assert "expected <id>" in r.stderr and "<startYYYYMMDD>_<endYYYYMMDD>" in r.stderr
 
 
 def test_end_to_end_output_is_date_sorted(tmp_path):

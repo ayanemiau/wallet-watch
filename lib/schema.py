@@ -108,6 +108,12 @@ class Account:
     # optional human-readable note (institution, card purpose, etc.)
     description: str = ""
 
+    # handler-specific operator identity — the value a handler needs to know
+    # "which participant is me". Currently only the Splitwise handler uses it:
+    # it names the per-person column ("me") to read from each shared-ledger row.
+    # Empty for accounts whose handler needs no per-operator config.
+    handler_user: str = ""
+
 
 # --- CSV encoding ---
 #

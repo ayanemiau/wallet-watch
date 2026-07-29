@@ -78,15 +78,22 @@ class Normalizer:
                     raise NormalizeError(
                         f"{raw_transaction_path.name}:{lineno}: unexpected trailing data: {extra!r}")
                 try:
-                    txn = handle(row, account)
+                    result = handle(row, account)
                 except (KeyError, ValueError) as e:
                     raise NormalizeError(f"{raw_transaction_path.name}:{lineno}: {e}")
-                # dates are YYYY-MM-DD, so a lexicographic compare is chronological
-                if (start_date is not None and txn.date < start_date) or \
-                        (end_date is not None and txn.date > end_date):
-                    dropped += 1
-                    continue
-                kept.append(txn)
+                # a handler may emit 0, 1, or several Transactions from one raw
+                # row: None drops the row (e.g. a summary line), a bare
+                # Transaction is the common case, a list splits one row into
+                # several (e.g. Splitwise's expense + reimbursement).
+                produced = [] if result is None else \
+                    [result] if isinstance(result, Transaction) else result
+                for txn in produced:
+                    # dates are YYYY-MM-DD, so a lexicographic compare is chronological
+                    if (start_date is not None and txn.date < start_date) or \
+                            (end_date is not None and txn.date > end_date):
+                        dropped += 1
+                        continue
+                    kept.append(txn)
 
         # extend only once parsing succeeded, so a failed inject leaves no
         # half-parsed file behind for a caller that catches and continues

@@ -9,11 +9,14 @@ registry is keyed by Account.type, never by Account.id — the repo therefore
 never needs to know a real account id.
 """
 
-from typing import Callable, Dict
+from typing import Callable, Dict, List, Union
 
 from schema import Account, Transaction
 
-Handler = Callable[[Dict[str, str], Account], Transaction]
+# a handler maps one raw row to zero (None — e.g. a summary line), one, or
+# several (a list — e.g. Splitwise's expense + reimbursement) Transactions.
+Handler = Callable[[Dict[str, str], Account],
+                   Union[Transaction, List[Transaction], None]]
 
 HANDLERS: Dict[str, Handler] = {}
 
@@ -45,4 +48,4 @@ def has_handler(type_: str) -> bool:
 
 
 # import for side effect: each module registers its types on import
-from . import apple, capital, chase, discover, wealthfront  # noqa: E402,F401
+from . import apple, capital, chase, discover, splitwise, wealthfront  # noqa: E402,F401
