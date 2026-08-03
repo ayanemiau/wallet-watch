@@ -20,7 +20,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from normalize_batch import (  # noqa: E402
     account_id_from_filename,
-    date_range_from_filename,
+    date_range_from_batch_id,
     latest_batch_dir,
 )
 
@@ -36,26 +36,36 @@ def read_output(batch_dir: Path):
 
 
 def test_account_id_is_filename_prefix():
+    assert account_id_from_filename(Path("chaseXXXX.csv")) == "chaseXXXX"
+
+
+def test_account_id_ignores_everything_after_the_id():
+    # a Splitwise group label, or a date stamp left over from when filenames
+    # carried the window — both are free labels; the id is still the first field.
+    assert account_id_from_filename(Path("splitwise_fakegroup.csv")) == "splitwise"
     assert account_id_from_filename(Path("chaseXXXX_20250101_20260630.csv")) == "chaseXXXX"
 
 
-def test_date_range_from_filename():
-    assert date_range_from_filename(Path("chaseXXXX_20250101_20260630.csv")) == \
-        ("2025-01-01", "2026-06-30")
+def test_date_range_from_batch_id():
+    assert date_range_from_batch_id(Path("20260101-20260131")) == \
+        ("2026-01-01", "2026-01-31")
 
 
-def test_date_range_ignores_label_segment():
-    # a Splitwise group label sits between the id and the dates; the window is
-    # still the last two fields, and the id is still the first (below).
-    assert date_range_from_filename(Path("splitwise_bond_20250101_20260630.csv")) == \
-        ("2025-01-01", "2026-06-30")
-    assert account_id_from_filename(Path("splitwise_bond_20250101_20260630.csv")) == \
-        "splitwise"
+@pytest.mark.parametrize("name, match", [
+    ("notes", "must be named"),                     # not a date range at all
+    ("2026-01-01_2026-01-31", "must be named"),     # right dates, wrong shape
+    ("20260101-20261301", "bad date range"),        # month 13
+    ("20260131-20260101", "start date is after"),   # reversed
+])
+def test_bad_batch_id_is_hard_error(name, match):
+    with pytest.raises(SystemExit, match=match):
+        date_range_from_batch_id(Path(name))
 
 
-def test_malformed_filename_is_hard_error(tmp_path):
-    # a name without the <id>_<start>_<end> shape exits non-zero
-    batch = tmp_path / "20260101-20260131"
+def test_nonconforming_batch_dir_is_hard_error(tmp_path):
+    # --batch-dir whose name isn't a date range: the run has no window to filter
+    # to, so it exits non-zero rather than guessing.
+    batch = tmp_path / "junk"
     (batch / "raw").mkdir(parents=True)
     (batch / "raw" / "chaseXXXX.csv").write_text("a\n")
     r = subprocess.run(
@@ -64,7 +74,31 @@ def test_malformed_filename_is_hard_error(tmp_path):
         capture_output=True, text=True,
     )
     assert r.returncode != 0
-    assert "expected <id>" in r.stderr and "<startYYYYMMDD>_<endYYYYMMDD>" in r.stderr
+    assert "must be named <startYYYYMMDD>-<endYYYYMMDD>" in r.stderr
+
+
+def test_bare_filenames_use_the_batch_range(tmp_path):
+    # the new convention: raw files carry only the account id, and the batch
+    # name supplies the window. Same inputs and same result as the dated names
+    # in test_end_to_end_output_is_date_sorted.
+    out_batch = tmp_path / "20260101-20260131"
+    (out_batch / "raw").mkdir(parents=True)
+    for f in (BATCH / "raw").glob("*.csv"):
+        bare = f.stem.split("_")[0] + ".csv"
+        (out_batch / "raw" / bare).write_bytes(f.read_bytes())
+
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT),
+         "--batch-dir", str(out_batch), "--data-dir", str(DATA)],
+        check=True, capture_output=True, text=True,
+    )
+
+    rows = read_output(out_batch)
+
+    assert len(rows) == 6
+    assert "2025-12-31" not in {r["date"] for r in rows}    # batch range still filters
+    assert "batch range: 2026-01-01..2026-01-31" in r.stderr
+    assert "1 outside range dropped" in r.stderr
 
 
 def test_end_to_end_output_is_date_sorted(tmp_path):
@@ -97,7 +131,7 @@ def test_unknown_id_is_skipped_with_warning(tmp_path):
     # an id with no accounts.csv row is skipped (warned), not fatal
     batch = tmp_path / "20260101-20260131"
     (batch / "raw").mkdir(parents=True)
-    (batch / "raw" / "nosuchacct_20260101_20260131.csv").write_text("a\n")
+    (batch / "raw" / "nosuchacct.csv").write_text("a\n")
     r = subprocess.run(
         [sys.executable, str(SCRIPT),
          "--batch-dir", str(batch), "--data-dir", str(DATA)],

@@ -59,10 +59,10 @@ $WALLET_WATCH_DATA_DIR/
   batch/                         # transient per-run workspaces (one folder per processing run)
     20260101-20260630/           # batch id = YYYYMMDD-YYYYMMDD date range of the raw data
       raw/                       # user drops manual exports here, one file per account
-        chaseXXXX_20260101_20260630.csv    # <account-id>_<anything>.csv — id = prefix before the first _
-        apple_20260101_20260630.csv
-        amazon.csv                          # suffix optional
-        splitwise.csv
+        chaseXXXX.csv                       # <account-id>[_<label>].csv — id = prefix before the first _
+        apple.csv
+        splitwise_fakegroup.csv             # label (e.g. a Splitwise group) optional, ignored
+        amazon_20260101_20260630.csv        # a legacy date stamp is just a label now
       normalized_20260701_142530.csv   # step 2 output (staging), one per run — ledger-checked, user-approved
       categorized_20260701_143000.csv  # step 3 output (staging) — hard-filter hits (source filter-rules) + unmatched rows
       review_20260701_150000.csv       # step 4 output (staging) — ALL rows + resolved_by + approved (hard rows pre-approved; rest default 0)
@@ -88,7 +88,7 @@ The pipeline is **ad-hoc / batch-oriented**, not a daemon. Whenever the operator
 A batch flows through five steps with **two human gates**. Each step is a separate command so the operator can stop, inspect, and resume.
 
 ```
-1. ACQUIRE  user downloads/scrapes exports → batch/20260101-20260630/raw/<account-id>_<startYYYYMMDD>_<endYYYYMMDD>.csv
+1. ACQUIRE  user downloads/scrapes exports → batch/<startYYYYMMDD>-<endYYYYMMDD>/raw/<account-id>.csv
             (phase 1: files only, nothing parsed)
                  |
                  v  normalize (phase 2) = handler dispatch: account id = raw filename prefix →
@@ -127,7 +127,7 @@ A batch flows through five steps with **two human gates**. Each step is a separa
   - `corrected_description` is the **updated description** used by Phase 4 path 1: a clean rewrite of a cryptic `original_description` that the rule engine can then match. Empty when the original was good enough.
   - `category` is the **learnable** value: machine-set (Phase 3 hard filter, then Phase 4 dict/LLM), then **correctable by a human** in Phase 4 review. It is the column dict-match and the LLM reuse to label future transactions, so a human correction here is training signal — propagated by being committed to history and re-projected into the maps next run (no writeback; see §6.3). `category_source` (the `CategorySource` enum) records how the current value was set — `filter-rules` / `dict-match` / `llm-label` (machine) or `human-review`, and `NONE` when uncategorized (see §4d).
   - `category_override` is the **one-off** human layer: a special category for a transaction that must be treated differently. It wins downstream (`effective_category(txn) = category_override or category`, what commit/charts read) but is **never learned** — it must not seed the maps/LLM. The reviewer edits `corrected_description`, `category`, and `category_override`; **raw** fields (`original_description`, `amount`, `date`, `account`, `is_reference`) stay immutable.
-- `**Account`**: `id / name / type / description` — one row per source account in the data repo's `accounts.csv`. `id` is unique and equals the raw filename prefix (`raw/<id>_<startYYYYMMDD>_<endYYYYMMDD>.csv`); `name` is written to `Transaction.account`; `type` selects the Phase 2 handler.
+- `**Account`**: `id / name / type / description` — one row per source account in the data repo's `accounts.csv`. `id` is unique and equals the raw filename prefix (`raw/<id>[_<label>].csv`); `name` is written to `Transaction.account`; `type` selects the Phase 2 handler.
 
 Notes:
 
@@ -160,10 +160,10 @@ Defense in depth:
 For each account, obtain its export for the batch's date range and drop it at:
 
 ```
-batch/<batch-id>/raw/<account-id>_<startYYYYMMDD>_<endYYYYMMDD>.csv
+batch/<startYYYYMMDD>-<endYYYYMMDD>/raw/<account-id>.csv
 ```
 
-`<account-id>` (the prefix up to the first `_`) must match an `id` in the data repo's `accounts.csv` (see §4.1) — that filename is the contract Phase 2 dispatches on. The two fields after it are the export's window (e.g. `chaseXXXX_20250101_20260630.csv` → id `chaseXXXX`, window `2025-01-01 … 2026-06-30`); Phase 2 filters transactions to that inclusive range (see §4.2), dropping rows dated outside it. **Account ids therefore never appear in this repo** — code and fixtures only ever name a `type`.
+`<account-id>` (the prefix up to the first `_`) must match an `id` in the data repo's `accounts.csv` (see §4.1) — that filename is the contract Phase 2 dispatches on. **The batch dir's name is the date range** for every file in it (e.g. `batch/20250101-20260630/` → window `2025-01-01 … 2026-06-30`); Phase 2 filters transactions to that inclusive range (see §4.2), dropping rows dated outside it. A whole batch is one time period pulled across accounts, so the range lives in one place rather than being restamped onto every filename. Anything after the id is a free label the pipeline ignores — a Splitwise group (`splitwise_fakegroup.csv`), or a date stamp from when filenames carried the window (`chaseXXXX_20250101_20260630.csv` still resolves to id `chaseXXXX`, filtered to the *batch's* range). **Account ids therefore never appear in this repo** — code and fixtures only ever name a `type`.
 
 ### Acquisition ladder
 
@@ -202,13 +202,13 @@ splitwise,splitwise,splitwise,friend settlements
 
 `description` is optional and may be omitted entirely; the reader defaults it to empty.
 
-- `**id**` is unique and **equals the raw filename prefix** (`raw/<id>_<startYYYYMMDD>_<endYYYYMMDD>.csv`) — how a file is matched to its account. Real ids live only in the private data root, never here.
+- `**id**` is unique and **equals the raw filename prefix** (`raw/<id>[_<label>].csv`) — how a file is matched to its account. Real ids live only in the private data root, never here.
 - `**name`** is stamped onto the `account` field of every `Transaction` this account produces (several ids may share a name, e.g. both chase cards → `chase`, if desired).
 - `**type`** selects the handler.
 
 ### 2b Handler dispatch (schema conversion)
 
-Normalize walks `batch/<id>/raw/*.csv`; for each file it **extracts the account `id` from the filename prefix**, resolves that account's row in `accounts.csv`, and **selects the handler registered for the account's `type`**. Multiple ids can share a type (e.g. two chase credit cards → `chase-credit`), so the handler is keyed by `type`, not by `id`. A file the pipeline can't process yet — an `id` with no `accounts.csv` row, or a `type` with no registered handler — is **skipped with a warning** (the run continues and still exits 0), so a batch that mixes handled and not-yet-handled accounts still produces output for the handled ones. A **malformed filename** (not `<id>_<start>_<end>.csv`) stays a hard error — that's a naming-contract violation, not an unsupported account.
+Normalize walks `batch/<id>/raw/*.csv`; for each file it **extracts the account `id` from the filename prefix**, resolves that account's row in `accounts.csv`, and **selects the handler registered for the account's `type`**. Multiple ids can share a type (e.g. two chase credit cards → `chase-credit`), so the handler is keyed by `type`, not by `id`. A file the pipeline can't process yet — an `id` with no `accounts.csv` row, or a `type` with no registered handler — is **skipped with a warning** (the run continues and still exits 0), so a batch that mixes handled and not-yet-handled accounts still produces output for the handled ones. A **batch dir whose name isn't `<startYYYYMMDD>-<endYYYYMMDD>`** is a hard error — the name *is* the date range, so an unparseable one leaves nothing to filter on. A raw filename, by contrast, only needs a resolvable id prefix.
 
 A **handler** is `(raw_row, account) → Transaction` — this is the **data schema conversion** step, turning one source's raw columns into unified `Transaction` rows. Normalize does the file reading and hands the handler one parsed row at a time. Handlers do **not** set `is_reference` or `category`: ledger references are stamped later in §4.3, and categories belong to Phase 3. The registry is keyed by `type`:
 
@@ -227,7 +227,7 @@ def handle_credit(row, account) -> Transaction:
 
 Implemented types: `chase-checking`, `chase-credit` (`lib/handlers/chase.py`), `discover-credit` (`discover.py`), `capital-saving` (`capital.py`), `wealthfront-saving` (`wealthfront.py`), `apple-credit` (`apple.py`). Each handler normalizes its source's sign convention to ours (negative = spent): Discover and Apple Card flip their sign, Capital One signs an unsigned magnitude from its `Credit`/`Debit` type, chase/wealthfront pass amounts through already-signed. The Apple Card handler additionally folds Apple's shipped `Category` and cleaned `Merchant` columns into `original_description` (as `"<Category> <Merchant> <Description>"`) for richer downstream matching — text only; `category` stays empty for Phase 3.
 
-**Library vs orchestrator are separate files.** The `Normalizer` library lives in `lib/normalizer.py` — `inject(raw_path, handler, account, start_date=None, end_date=None)` parses one export, filters its rows to the inclusive `[start_date, end_date]` window (dropping rows dated outside, and returning how many it kept vs. dropped), and accumulates the rest; `output(path)` writes them date-sorted. It holds no knowledge of `argparse`, `accounts.csv` or the batch layout. The **orchestrator** `scripts/normalize_batch.py` owns all of that: it resolves the data root, scans `raw/`, does id → account → type, derives each file's window from its filename, and feeds the library — reporting the dropped count per file. That "scan dir → look up type → run" flow is deliberately replaceable — a future UI (drag files in, one-click run) is just another orchestrator over the same class, and may make the batch script dev/testing-only. Errors raise `NormalizeError` rather than exiting, so an embedding caller can catch, report, and continue — only the CLI turns them into a non-zero exit.
+**Library vs orchestrator are separate files.** The `Normalizer` library lives in `lib/normalizer.py` — `inject(raw_path, handler, account, start_date=None, end_date=None)` parses one export, filters its rows to the inclusive `[start_date, end_date]` window (dropping rows dated outside, and returning how many it kept vs. dropped), and accumulates the rest; `output(path)` writes them date-sorted. It holds no knowledge of `argparse`, `accounts.csv` or the batch layout. The **orchestrator** `scripts/normalize_batch.py` owns all of that: it resolves the data root, scans `raw/`, does id → account → type, derives the batch's window from the batch dir's name, and feeds the library — reporting the dropped count per file. That "scan dir → look up type → run" flow is deliberately replaceable — a future UI (drag files in, one-click run) is just another orchestrator over the same class, and may make the batch script dev/testing-only. Errors raise `NormalizeError` rather than exiting, so an embedding caller can catch, report, and continue — only the CLI turns them into a non-zero exit.
 
 A handler can be **just a function** (light sources like a clean bank CSV) or a **heavier module** (e.g. Apple email parsing, e-commerce order joining). The registry keeps that choice per-type and swappable; we start light and promote to a module only when a source earns it.
 

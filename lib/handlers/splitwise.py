@@ -6,7 +6,7 @@ Splitwise is a shared-ledger export, not a bank statement, so it differs from
 every other handler in three ways:
 
 1. One account, many files. A person can export several groups
-   (splitwise_bond_..., splitwise_yoruhato_...); all resolve to the single
+   (splitwise_groupone.csv, splitwise_grouptwo.csv); all resolve to the single
    `splitwise` account. We treat each file independently.
 
 2. Per-person NET columns. Every participant gets a column; its value is that

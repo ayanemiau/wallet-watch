@@ -2,7 +2,8 @@
 
 Scans a batch's raw/ dir, resolves each file's account against accounts.csv,
 runs the matching handler through Normalizer, and writes a run-timestamped
-normalized_<YYYYMMDD>_<HHMMSS>.csv. This is one orchestrator over the library;
+normalized_<YYYYMMDD>_<HHMMSS>.csv. The batch dir's name (YYYYMMDD-YYYYMMDD) is
+the date range for every file in it. This is one orchestrator over the library;
 a UI (drag files in, one-click run) would be another. The "scan dir -> load
 files -> look up type -> run" flow lives here, not in the library, precisely so
 it can be replaced.
@@ -37,11 +38,14 @@ BATCH_ID_RE = re.compile(r"\d{8}-\d{8}")
 
 def parse_args() -> argparse.Namespace:
     # 1. --batch-dir points at batch/<batch-id>/; raw inputs come from its
-    #    raw/ subdir and output goes to a timestamped file beside it.
+    #    raw/ subdir and output goes to a timestamped file beside it. Its name
+    #    must be YYYYMMDD-YYYYMMDD — that range is what the run filters to.
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--batch-dir", type=Path, default=None,
-                   help="batch workspace, e.g. $WALLET_WATCH_DATA_DIR/batch/20260101-20260630; "
-                        "defaults to the latest-start batch under <data-root>/batch/")
+                   help="batch workspace named <startYYYYMMDD>-<endYYYYMMDD>, e.g. "
+                        "$WALLET_WATCH_DATA_DIR/batch/20260101-20260630 (the name is the "
+                        "batch's date range); defaults to the latest-start batch under "
+                        "<data-root>/batch/")
     p.add_argument("--data-dir", type=Path, default=None,
                    help="data root holding accounts.csv; defaults to $WALLET_WATCH_DATA_DIR")
     return p.parse_args()
@@ -108,26 +112,33 @@ def load_accounts(data_dir: Path) -> Dict[str, Account]:
 
 def account_id_from_filename(raw_file: Path) -> str:
     # 3a. The id is the filename prefix, up to the first underscore:
-    #     chaseXXXX_20250101_20260630.csv -> chaseXXXX
+    #     chaseXXXX.csv                         -> chaseXXXX
+    #     splitwise_fakegroup.csv               -> splitwise
+    #     chaseXXXX_20250101_20260630.csv       -> chaseXXXX
+    #     Anything after the id is a free label (a Splitwise group, an old date
+    #     stamp from when filenames carried the window) and is ignored.
     return raw_file.stem.split("_")[0]
 
 
-def date_range_from_filename(raw_file: Path) -> Tuple[str, str]:
-    # 3b. The window is the LAST two underscore fields, YYYYMMDD each:
-    #     chaseXXXX_20250101_20260630.csv       -> ("2025-01-01", "2026-06-30")
-    #     splitwise_bond_20250101_20260630.csv  -> ("2025-01-01", "2026-06-30")
-    #     inject() then filters transactions to this inclusive range. Any field
-    #     between the id and the dates is a free label (e.g. a Splitwise group)
-    #     and is ignored here — the id is still the first field (account_id_...).
-    parts = raw_file.stem.split("_")
-    if len(parts) < 3:
+def date_range_from_batch_id(batch_dir: Path) -> Tuple[str, str]:
+    # 3b. The window comes from the batch dir's name, YYYYMMDD-YYYYMMDD — one
+    #     range for the whole batch, since a batch is one time period pulled
+    #     across accounts:
+    #         batch/20250101-20260630/ -> ("2025-01-01", "2026-06-30")
+    #     inject() then filters every file's transactions to this inclusive
+    #     range. A batch dir named anything else is a hard error: the name is
+    #     the range, so an unparseable one leaves nothing to filter on.
+    if not BATCH_ID_RE.fullmatch(batch_dir.name):
         raise SystemExit(
-            f"{raw_file.name}: expected <id>[_<label>...]_<startYYYYMMDD>_<endYYYYMMDD>.csv")
+            f"{batch_dir.name}: batch dir must be named <startYYYYMMDD>-<endYYYYMMDD>")
+    raw_start, raw_end = batch_dir.name.split("-")
     try:
-        start = datetime.strptime(parts[-2], "%Y%m%d").strftime("%Y-%m-%d")
-        end = datetime.strptime(parts[-1], "%Y%m%d").strftime("%Y-%m-%d")
+        start = datetime.strptime(raw_start, "%Y%m%d").strftime("%Y-%m-%d")
+        end = datetime.strptime(raw_end, "%Y%m%d").strftime("%Y-%m-%d")
     except ValueError as e:
-        raise SystemExit(f"{raw_file.name}: bad date range in filename: {e}")
+        raise SystemExit(f"{batch_dir.name}: bad date range in batch name: {e}")
+    if start > end:
+        raise SystemExit(f"{batch_dir.name}: start date is after end date")
     return start, end
 
 
@@ -149,6 +160,10 @@ def main() -> None:
         batch_dir = latest_batch_dir(data_dir)
         print(f"using latest batch: {batch_dir.name}", file=sys.stderr)
 
+    # one window for the whole batch, read off the batch dir's name
+    start, end = date_range_from_batch_id(batch_dir)
+    print(f"batch range: {start}..{end}", file=sys.stderr)
+
     # timestamp the output so a rerun versions rather than overwrites (run time,
     # local): normalized_<YYYYMMDD>_<HHMMSS>.csv
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -168,7 +183,6 @@ def main() -> None:
                 print(f"  {raw_file.name}: no handler for account type {account.type!r}, "
                       f"skipping", file=sys.stderr)
                 continue
-            start, end = date_range_from_filename(raw_file)
             result = normalizer.inject(raw_file, account.type, account, start, end)
             msg = f"  {raw_file.name}: {result.kept} rows in {start}..{end}"
             if result.dropped:
