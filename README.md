@@ -4,47 +4,52 @@
 
 Now Loading...
 
-### Usage
+---
 
-Process a batch end to end: normalize → rule editor → categorize. Runs against the
-batch with the latest start date, and pins every step to the same normalized CSV.
-Close the editor window to continue on to categorize.
+### The magical one-liner
+
+One-time installing dependencies.
 
 ```bash
 pip3 install -r tools/rule_editor/requirements.txt
+```
+
+Run the magic end-to-end: normalized raw csv transactions --> launch rule editor --> categorize.
+
+```bash
 python3 scripts/process_batch.py --data-dir ../wallet-watch-data
-
-# same chain without the editor, for a rerun once the rules are settled
-python3 scripts/process_batch.py --data-dir ../wallet-watch-data --skip-editor
 ```
 
-The individual phase commands below stay the way to run one step on its own.
+### Individual phases
 
-Launch the interactive category rule editor.
-
-```bash
-pip3 install -r tools/rule_editor/requirements.txt
-python3 tools/rule_editor/editor.py --data-dir ../wallet-watch-data
-```
-
-Manually run phase 2 - normalization
+1 - Normalization: process raw csv transactions downloaded from banks and combine into unified transaction list.
 
 ```bash
 # --batch-dir is optional. if not specified, the script will run on the batch with latest start date.
 python3 scripts/normalize_batch.py --data-dir ../wallet-watch-data
 ```
 
-Manually run phase 3 - categorize based on filter rules
+2 - Launch the interactive category rule editor UI.
+
+```bash
+pip3 install -r tools/rule_editor/requirements.txt
+python3 tools/rule_editor/editor.py --data-dir ../wallet-watch-data
+```
+
+3 - Categorization: apply categories based on hard rules.
+
 ```bash
 scripts/categorize.py --data-dir ../wallet-watch-data
 ```
 
-Manually run phase 4 - resolve unmatched categories
+4 - Resolution: resolve unmatched transactions base on previous categories.
+
 ```bash
 python3 scripts/resolve_batch.py --data-dir ../wallet-watch-data
 ```
 
-Launch the review UI for phase 4
+5 - Launch the interactive resolution review UI.
+
 ```bash
 pip3 install -r tools/review_approver/requirements.txt
 python3 tools/review_approver/approver.py --data-dir ../wallet-watch-data
