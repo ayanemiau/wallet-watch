@@ -44,7 +44,7 @@ import tool_theme  # noqa: E402
 from review_model import (candidates, counts, is_dirty, match_candidates,  # noqa: E402
                           split_tabs)
 from resolve_review import ReviewRow, read_review, write_review  # noqa: E402
-from schema import CategorySource  # noqa: E402
+from schema import UNCATEGORIZED, CategorySource  # noqa: E402
 
 # a batch dir is named by its date range, YYYYMMDD-YYYYMMDD
 BATCH_ID_RE = re.compile(r"\d{8}-\d{8}")
@@ -436,9 +436,11 @@ class ReviewApprover:
 
     def _on_category(self, sender, app_data, user_data) -> None:
         # correcting the learned category: stamp category_source=HUMAN_REVIEW so
-        # the value no longer claims a machine provenance. Empty -> NONE.
+        # the value no longer claims a machine provenance. Clearing the box puts
+        # the row back to unplaced — NONE plus the UNCATEGORIZED label, the same
+        # pair Phase 3 writes, rather than a blank that would commit empty.
         txn = self.rows[user_data].txn
-        txn.category = app_data
+        txn.category = app_data or UNCATEGORIZED
         txn.category_source = (CategorySource.HUMAN_REVIEW if app_data
                                else CategorySource.NONE)
         self.refresh()

@@ -25,7 +25,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
-from schema import Transaction
+from schema import Transaction, is_unset_category
 
 # 1. casefold + drop punctuation (unicode-aware, so non-ASCII merchant names
 #    survive), 2. drop digit runs (store #, order id, dates), 3. collapse space.
@@ -189,7 +189,9 @@ def build_category_map(history: List[Transaction]) -> CategoryLookup:
     wild: Dict[str, str] = {}
     amt: Dict[Tuple[str, str], str] = {}
     for txn in history:
-        if not txn.category:                 # skip uncategorized / override-only rows
+        # skip uncategorized (incl. the UNCATEGORIZED label) / override-only
+        # rows — learning the placeholder would dict-match it onto future rows
+        if is_unset_category(txn.category):
             continue
         key = norm_key(txn.original_description)
         wild[key] = txn.category             # last wins -> most recent for the merchant

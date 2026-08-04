@@ -19,7 +19,12 @@ class CategorySource(str, Enum):
     kebab-case string values, consistent with the codebase's other tokens
     (account types like `chase-checking`, and the sibling `resolved_by` values
     `desc-map`/`cat-map`). Member names stay UPPER_SNAKE; only the on-disk value
-    is kebab. An empty `category` is `NONE`.
+    is kebab.
+
+    THIS, not the `category` string, is what "was this row placed?" reads —
+    see `is_categorized`. A row nothing placed pairs `NONE` with the
+    `UNCATEGORIZED` placeholder category (rows written before that placeholder
+    existed pair it with `""`, and still read correctly).
     """
 
     NONE = ""                    # no category yet (uncategorized) — the default
@@ -27,6 +32,13 @@ class CategorySource(str, Enum):
     DICT_MATCH = "dict-match"    # learned from prior categories, via dict/lookup match
     LLM_LABEL = "llm-label"      # learned from prior categories, via the LLM agent
     HUMAN_REVIEW = "human-review"  # entered by a human in Phase 4 review (≠ category_override)
+
+
+# The category written when no rule, map, agent or human placed a row. A visible
+# label beats a blank cell downstream (categorized CSV, review UI, the Sheet) —
+# but it is only a LABEL: never test it to decide whether a row was categorized,
+# or an unplaced row reads as placed. Use is_categorized / is_unset_category.
+UNCATEGORIZED = "UNCATEGORIZED"
 
 
 @dataclass
@@ -197,6 +209,26 @@ def from_row(row: Dict[str, str]) -> Transaction:
         category_source=decode_source(row.get("category_source", "")),
         tags=decode_tags(row.get("tags", "")),
     )
+
+
+def is_categorized(txn: Transaction) -> bool:
+    """Did anything actually place this row? Phase 4's input test.
+
+    Reads `category_source`, not `category`: the `category` column carries the
+    UNCATEGORIZED placeholder for unplaced rows, so a truthiness test on it
+    would call every unplaced row categorized — and Phase 4 would pass them
+    through pre-approved, straight past GATE 2.
+    """
+    return txn.category_source is not CategorySource.NONE
+
+
+def is_unset_category(value: str) -> bool:
+    """Is this category VALUE a non-answer — empty or the placeholder?
+
+    For the times a bare string is all there is (an effective category, a
+    history row's learnable value) and no `category_source` is at hand.
+    """
+    return not value or value == UNCATEGORIZED
 
 
 def effective_category(txn: Transaction) -> str:

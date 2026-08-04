@@ -8,7 +8,7 @@ sys.path.insert(0, str(REPO / "lib"))
 
 from resolve_lookup import (CategoryLookup, Lookup, build_category_map,  # noqa: E402
                             build_description_map, build_lookup, canon_amount, norm_key)
-from schema import CategorySource, Transaction  # noqa: E402
+from schema import UNCATEGORIZED, CategorySource, Transaction  # noqa: E402
 
 
 def txn(desc, amount="-5.00", category="", **kw) -> Transaction:
@@ -174,6 +174,15 @@ def test_build_skips_override_only_rows():
     history = [txn("SPECIAL LLC", "-5.00", category="", category_override="Gift")]
     cm = build_category_map(history)
     assert cm.get("SPECIAL LLC", "-5.00") is None
+    assert len(cm) == 0
+
+
+def test_build_skips_the_uncategorized_placeholder():
+    # UNCATEGORIZED is a label for "nothing placed this", not a category — learning
+    # it would dict-match the placeholder onto future rows as if it were real.
+    history = [txn("MYSTERY LLC", "-5.00", category=UNCATEGORIZED)]
+    cm = build_category_map(history)
+    assert cm.get("MYSTERY LLC", "-5.00") is None
     assert len(cm) == 0
 
 

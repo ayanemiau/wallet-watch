@@ -15,7 +15,7 @@ from resolve_review import (BY_CAT_MAP, BY_DESC_MAP, BY_HARD, BY_NONE, ReviewRow
                             read_review, write_review)
 from review_model import (candidates, counts, is_dirty, is_uncategorized,  # noqa: E402
                           match_candidates, needs_review, split_tabs)
-from schema import CategorySource, Transaction  # noqa: E402
+from schema import UNCATEGORIZED, CategorySource, Transaction  # noqa: E402
 
 
 def txn(desc="MYSTERY LLC", category="", override="", **kw) -> Transaction:
@@ -59,8 +59,18 @@ def test_is_uncategorized_true_when_no_category_anywhere():
     assert is_uncategorized(ReviewRow(txn("WHO KNOWS"))) is True
 
 
+def test_placeholder_category_still_counts_as_uncategorized():
+    # the row Phase 3 labelled UNCATEGORIZED has no real category to commit
+    assert is_uncategorized(ReviewRow(txn("WHO KNOWS", category=UNCATEGORIZED))) is True
+
+
 def test_override_makes_a_row_categorized():
     assert is_uncategorized(ReviewRow(txn("WHO KNOWS", override="Gifts"))) is False
+
+
+def test_override_beats_the_placeholder():
+    assert is_uncategorized(
+        ReviewRow(txn("WHO KNOWS", category=UNCATEGORIZED, override="Gifts"))) is False
 
 
 def test_machine_category_makes_a_row_categorized():

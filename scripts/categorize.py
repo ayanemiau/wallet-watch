@@ -28,7 +28,7 @@ from datetime import datetime  # noqa: E402
 from typing import List  # noqa: E402
 
 from categorizer import Categorizer  # noqa: E402
-from schema import FIELDNAMES, Transaction, from_row, to_row  # noqa: E402
+from schema import FIELDNAMES, Transaction, from_row, is_categorized, to_row  # noqa: E402
 
 # a batch dir is named by its date range, YYYYMMDD-YYYYMMDD
 BATCH_ID_RE = re.compile(r"\d{8}-\d{8}")
@@ -128,7 +128,8 @@ def main() -> None:
     write_transactions(out_path, categorized)
 
     total = len(categorized)
-    matched = sum(1 for t in categorized if t.category)
+    # category_source, not category: a miss now carries the UNCATEGORIZED label
+    matched = sum(1 for t in categorized if is_categorized(t))
     print(f"categorized {matched}/{total} rows ({total - matched} uncategorized) "
           f"using {rules_path.name}", file=sys.stderr)
     print(f"read {input_path.name} -> wrote {out_path}", file=sys.stderr)

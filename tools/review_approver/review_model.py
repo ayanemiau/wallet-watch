@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 from resolve_review import BY_HARD, ReviewRow
-from schema import effective_category
+from schema import effective_category, is_unset_category
 
 
 def needs_review(row: ReviewRow) -> bool:
@@ -19,8 +19,8 @@ def needs_review(row: ReviewRow) -> bool:
 
 
 def is_uncategorized(row: ReviewRow) -> bool:
-    """No category will commit for this row — neither machine nor human set one."""
-    return not effective_category(row.txn)
+    """No real category will commit for this row — the placeholder isn't one."""
+    return is_unset_category(effective_category(row.txn))
 
 
 def split_tabs(rows: List[ReviewRow]) -> Tuple[List[ReviewRow], List[ReviewRow]]:

@@ -19,7 +19,8 @@ sys.path.insert(0, str(SCRIPTS))
 
 from categorizer import CATEGORIZER_VERSION, Categorizer  # noqa: E402
 from rules import Condition, Rule, save_rules  # noqa: E402
-from schema import CategorySource, Transaction  # noqa: E402
+from schema import (UNCATEGORIZED, CategorySource, Transaction,  # noqa: E402
+                    is_categorized)
 
 
 def txn(**kw) -> Transaction:
@@ -49,10 +50,19 @@ def test_fills_category_from_matching_rule(tmp_path):
     assert result.category == "Coffee"
 
 
-def test_unmatched_row_keeps_empty_category(tmp_path):
+def test_unmatched_row_is_labelled_uncategorized(tmp_path):
     cfg = write_rules(tmp_path, [coffee_rule(value="FAKE GROCER")])
     (result,) = Categorizer().apply_rules([txn()], cfg)
-    assert result.category == ""
+    assert result.category == UNCATEGORIZED
+
+
+def test_unmatched_row_keeps_source_none(tmp_path):
+    # the label is cosmetic — category_source stays NONE so is_categorized()
+    # still reports the row as unplaced and Phase 4 picks it up.
+    cfg = write_rules(tmp_path, [coffee_rule(value="FAKE GROCER")])
+    (result,) = Categorizer().apply_rules([txn()], cfg)
+    assert result.category_source is CategorySource.NONE
+    assert is_categorized(result) is False
 
 
 def test_hard_filter_hit_stamps_filter_rules(tmp_path):
@@ -83,7 +93,7 @@ def test_any_vs_all_match_modes(tmp_path):
     assert Categorizer().apply_rules([txn()], cfg)[0].category == "Drinks"
     # neither condition holds -> no match
     other = txn(original_description="FAKE GROCER")
-    assert Categorizer().apply_rules([other], cfg)[0].category == ""
+    assert Categorizer().apply_rules([other], cfg)[0].category == UNCATEGORIZED
 
 
 def test_matches_on_non_description_columns(tmp_path):
@@ -94,7 +104,7 @@ def test_matches_on_non_description_columns(tmp_path):
              conditions=[Condition("amount", "gt", "0")]),
     ])
     assert Categorizer().apply_rules([txn(amount="50.00")], cfg)[0].category == "Refund"
-    assert Categorizer().apply_rules([txn(amount="-50.00")], cfg)[0].category == ""
+    assert Categorizer().apply_rules([txn(amount="-50.00")], cfg)[0].category == UNCATEGORIZED
 
 
 # --- everything but category is preserved ---
@@ -125,7 +135,7 @@ def test_order_is_preserved(tmp_path):
             txn(original_description="FAKE GROCER"),
             txn(original_description="FAKE COFFEE 2")]
     result = Categorizer().apply_rules(rows, cfg)
-    assert [r.category for r in result] == ["Coffee", "", "Coffee"]
+    assert [r.category for r in result] == ["Coffee", UNCATEGORIZED, "Coffee"]
 
 
 # --- edge cases ---
@@ -134,7 +144,7 @@ def test_order_is_preserved(tmp_path):
 def test_empty_rule_table_leaves_all_uncategorized(tmp_path):
     cfg = write_rules(tmp_path, [])
     result = Categorizer().apply_rules([txn(), txn()], cfg)
-    assert all(r.category == "" for r in result)
+    assert all(r.category == UNCATEGORIZED for r in result)
 
 
 def test_empty_transaction_list(tmp_path):
@@ -147,7 +157,7 @@ def test_missing_rule_file_is_a_clean_error(tmp_path):
     # is not an error — everything stays uncategorized
     missing = str(tmp_path / "rules" / "keywords.yaml")
     result = Categorizer().apply_rules([txn()], missing)
-    assert result[0].category == ""
+    assert result[0].category == UNCATEGORIZED
 
 
 def test_categorizer_version_is_exposed():

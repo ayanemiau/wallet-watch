@@ -28,8 +28,12 @@ OUTPUT_RE = re.compile(r"review_\d{8}_\d{6}\.csv")
 
 
 def txn(desc, category="", **kw) -> Transaction:
+    # Phase 3 stamps a source alongside every category it fills, and Phase 4
+    # keys on the source — pair them unless a test sets one explicitly.
     base = dict(date="2026-01-05", amount="-6.00", account="Fake Card",
                 original_description=desc, category=category)
+    if category:
+        base["category_source"] = CategorySource.FILTER_RULES
     base.update(kw)
     return Transaction(**base)
 

@@ -46,7 +46,7 @@ from resolve_lookup import CategoryLookup, Lookup
 from resolve_review import (BY_AGENT, BY_CAT_MAP, BY_DESC_MAP, BY_HARD, BY_NONE,
                             ReviewRow)
 from rules import Rule, categorize_row
-from schema import CategorySource, Transaction, to_row
+from schema import CategorySource, Transaction, is_categorized, to_row
 
 # An agent proposes a (corrected_description, category) for a still-unmatched row.
 # Either element may be None. Deferred (plan.md §6.2 / M7) — the type is the seam.
@@ -54,8 +54,13 @@ Agent = Callable[[Transaction], "AgentProposal"]
 
 
 def unmatched(transactions: List[Transaction]) -> List[Transaction]:
-    """The rows Phase 3 could not place — Phase 4's input."""
-    return [t for t in transactions if not t.category]
+    """The rows Phase 3 could not place — Phase 4's input.
+
+    Keyed on `category_source`, not on `category`: an unplaced row carries the
+    UNCATEGORIZED label, so a truthiness test on the category would return
+    nothing here and quietly starve Phase 4.
+    """
+    return [t for t in transactions if not is_categorized(t)]
 
 
 class Resolver:
@@ -84,7 +89,9 @@ class Resolver:
         """
         out: List[ReviewRow] = []
         for txn in transactions:
-            if txn.category:
+            # category_source, not category: pre-approving on the label would
+            # send every unplaced row straight past GATE 2 (see `unmatched`).
+            if is_categorized(txn):
                 out.append(ReviewRow(txn, resolved_by=BY_HARD, approved=True))
             else:
                 out.append(self._resolve_one(txn))

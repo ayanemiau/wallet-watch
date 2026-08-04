@@ -10,14 +10,24 @@ from resolve_lookup import CategoryLookup, Lookup, norm_key  # noqa: E402
 from resolve_review import BY_CAT_MAP, BY_DESC_MAP, BY_HARD, BY_NONE  # noqa: E402
 from resolver import Resolver, unmatched  # noqa: E402
 from rules import Condition, Rule  # noqa: E402
-from schema import CategorySource, Transaction  # noqa: E402
+from schema import UNCATEGORIZED, CategorySource, Transaction  # noqa: E402
 
 
 def txn(desc="SQ *BLUE BOTTLE #99", category="", **kw) -> Transaction:
+    # A categorized row always carries a source in the real pipeline (Phase 3
+    # stamps filter-rules alongside the category), and Phase 4 keys on the
+    # source — so pair them here too unless a test sets one explicitly.
     base = dict(date="2026-01-05", amount="-6.00", account="Fake Card",
                 original_description=desc, category=category)
+    if category:
+        base["category_source"] = CategorySource.FILTER_RULES
     base.update(kw)
     return Transaction(**base)
+
+
+def unplaced_txn(desc="MYSTERY LLC", **kw) -> Transaction:
+    """What Phase 3 hands Phase 4: the placeholder label, no source."""
+    return txn(desc=desc, category=UNCATEGORIZED, category_source=CategorySource.NONE, **kw)
 
 
 def coffee_rules():
@@ -138,6 +148,13 @@ def test_unmatched_filters_out_categorized_rows():
     assert [t.original_description for t in unmatched(rows)] == ["MYSTERY LLC"]
 
 
+def test_unmatched_selects_the_uncategorized_placeholder():
+    # UNCATEGORIZED is a label, not a category: keying on the string instead of
+    # category_source would return nothing here and starve Phase 4 entirely.
+    rows = [txn(desc="STARBUCKS", category="Coffee"), unplaced_txn()]
+    assert [t.original_description for t in unmatched(rows)] == ["MYSTERY LLC"]
+
+
 # --- resolve_all (full batch: hard rows pass through pre-approved) ---
 
 
@@ -150,6 +167,16 @@ def test_resolve_all_passes_hard_rows_through_pre_approved():
     assert row.approved is True
     assert row.txn.category == "Coffee"                            # untouched
     assert row.txn.category_source is CategorySource.FILTER_RULES  # preserved
+
+
+def test_resolve_all_does_not_pre_approve_the_placeholder():
+    # THE regression this design guards: a row carrying UNCATEGORIZED must go
+    # through the resolve paths, not out as a trusted hard hit — pre-approving
+    # it would walk it past GATE 2 without a human ever seeing it.
+    r = Resolver(coffee_rules(), Lookup(), CategoryLookup())
+    (row,) = r.resolve_all([unplaced_txn()])
+    assert row.resolved_by == BY_NONE
+    assert row.approved is False
 
 
 def test_resolve_all_interleaves_and_preserves_order():

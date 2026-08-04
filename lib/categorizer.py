@@ -12,9 +12,10 @@ So a rule that categorizes a transaction one way in the editor categorizes it th
 same way here.
 
 Scope: the Phase 3 hard filter (the human-maintained rule table) only. A row no
-rule matches keeps its existing (empty) category and is left for Phase 4
-("Process Unmatched Transactions", plan.md §6) to resolve and route through
-review — this library never flags or guesses.
+rule matches is labelled `UNCATEGORIZED` and left for Phase 4 ("Process
+Unmatched Transactions", plan.md §6) to resolve and route through review — this
+library never flags or guesses. The label is cosmetic; `category_source` stays
+`NONE`, and that is what Phase 4 selects on.
 
 The orchestrator that reads/writes batch files lives in `scripts/categorize.py`;
 this library knows nothing about the data root or batch layout.
@@ -25,7 +26,7 @@ from pathlib import Path
 from typing import List
 
 from rules import categorize_row, load_rules
-from schema import CategorySource, Transaction, to_row
+from schema import UNCATEGORIZED, CategorySource, Transaction, to_row
 
 # The categorizer carries a version (plan.md §5): output-schema changes must stay
 # backward compatible so committed batches can be re-run with a newer version.
@@ -42,8 +43,9 @@ class Categorizer:
 
         `rule_config` is the path to a `keywords.yaml` rule table. Rules are
         ordered and the first match wins (see lib/rules.py). A row no rule
-        matches keeps its existing category (empty on a normalized row) — it is
-        not an error. Inputs are not mutated; new `Transaction` objects are
+        matches is labelled `UNCATEGORIZED` with `category_source` left at
+        `NONE` — it is not an error, and `is_categorized` still reports it as
+        unplaced. Inputs are not mutated; new `Transaction` objects are
         returned in the same order.
         """
         rules = load_rules(Path(rule_config))
@@ -56,8 +58,9 @@ class Categorizer:
             # correction is honored on backfill/re-run (plan.md §6.1 path 1).
             category = categorize_row(rules, to_row(txn))
             # a hit is the hard filter: stamp category_source=FILTER_RULES.
-            # a miss leaves the row untouched (empty category) — Phase 4's input.
-            result.append(txn if category is None
+            # a miss gets the UNCATEGORIZED label but keeps category_source=NONE
+            # — the label is for humans, the source is Phase 4's input signal.
+            result.append(replace(txn, category=UNCATEGORIZED) if category is None
                           else replace(txn, category=category,
                                        category_source=CategorySource.FILTER_RULES))
         return result
