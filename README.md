@@ -6,6 +6,20 @@ Now Loading...
 
 ### Usage
 
+Process a batch end to end: normalize → rule editor → categorize. Runs against the
+batch with the latest start date, and pins every step to the same normalized CSV.
+Close the editor window to continue on to categorize.
+
+```bash
+pip3 install -r tools/rule_editor/requirements.txt
+python3 scripts/process_batch.py --data-dir ../wallet-watch-data
+
+# same chain without the editor, for a rerun once the rules are settled
+python3 scripts/process_batch.py --data-dir ../wallet-watch-data --skip-editor
+```
+
+The individual phase commands below stay the way to run one step on its own.
+
 Launch the interactive category rule editor.
 
 ```bash

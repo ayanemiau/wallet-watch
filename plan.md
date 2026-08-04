@@ -87,6 +87,8 @@ The pipeline is **ad-hoc / batch-oriented**, not a daemon. Whenever the operator
 
 A batch flows through five steps with **two human gates**. Each step is a separate command so the operator can stop, inspect, and resume.
 
+`scripts/process_batch.py` chains steps 2–3 for the latest batch — normalize, then the rule editor, then categorize when the editor's window closes — passing the run's `normalized_<runtime>.csv` to each so the rules are tuned against exactly the rows being categorized. It's a convenience over the phase commands, not a replacement: each still runs standalone, and steps 4–5 stay manual because GATE 2 lives between them.
+
 ```
 1. ACQUIRE  user downloads/scrapes exports → batch/<startYYYYMMDD>-<endYYYYMMDD>/raw/<account-id>.csv
             (phase 1: files only, nothing parsed)
